@@ -23,6 +23,8 @@ serde_json = { workspace = true }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 raw-window-handle = "0.6"
 xcap = "0.7"
+# --backdrop: a screenshot under the HUD, for previews
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

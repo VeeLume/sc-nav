@@ -19,7 +19,8 @@ pub fn glass() -> Color32 {
     Color32::from_rgba_unmultiplied(10, 14, 20, 170)
 }
 
-/// The HUD's font family: a heavier face that holds up over the game.
+/// The HUD's font family: Bahnschrift (DIN-like, close to the game's own
+/// HUD lettering), Segoe UI Semibold where it's missing.
 pub fn hud_font() -> egui::FontFamily {
     egui::FontFamily::Name("hud".into())
 }
@@ -34,9 +35,11 @@ fn fonts(ctx: &egui::Context) {
         fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "ui".into());
     }
     let mut hud = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
-    if let Some(bold) = read("seguisb.ttf") {
-        fonts.font_data.insert("hud".into(), egui::FontData::from_owned(bold).into());
-        hud.insert(0, "hud".into());
+    for (key, file) in [("hud-fallback", "seguisb.ttf"), ("hud", "bahnschrift.ttf")] {
+        if let Some(face) = read(file) {
+            fonts.font_data.insert(key.into(), egui::FontData::from_owned(face).into());
+            hud.insert(0, key.into());
+        }
     }
     fonts.families.insert(hud_font(), hud);
     ctx.set_fonts(fonts);

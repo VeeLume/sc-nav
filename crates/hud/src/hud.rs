@@ -1,30 +1,38 @@
 //! The HUD, drawn straight onto a transparent, click-through window over the
-//! whole screen and anchored to the game's own HUD:
+//! whole screen and anchored to the game's own HUD. The look follows
+//! Squadron 42's: thin glowing lines, markers without boxes, readouts as a
+//! large number over a small spaced label, and glass cards with an accent
+//! bar only for cues and alerts.
 //!
-//! - a marker under the game's compass at the target's bearing (an arrow at
-//!   the tape's end with the turn when it's beyond), the target's name,
-//!   distance and ETA under it, and the braking cue when it matters;
-//! - in space, the target where it is on screen (an arrow at the edge when
-//!   it isn't), from the overlay's view direction and the game's FOV;
+//! - a chevron under the game's compass at the target's bearing (sideways
+//!   at the tape's end, with the turn, when it's beyond); below it the
+//!   target's name, distance and ETA, and the braking cue when it matters;
+//! - in space, the target where it is on screen (a chevron at the edge
+//!   when it isn't), from the overlay's view direction and the game's FOV;
 //! - PULL UP below the crosshair.
 //!
-//! Positions are fractions of the screen height ([`Compass`]), measured on
-//! the game's HUD; the seat and the visor put their compass in different
-//! places. With debug on, the old strip ([`crate::panel`]) shows at the top left.
+//! Text sits on whole pixels, so a changing number never blurs. Sizes scale
+//! with the screen height (`u` is one point at 1080p). With debug on,
+//! [`crate::panel`] shows at the top left.
 
-use eframe::egui::{self, Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, vec2};
+use std::sync::Arc;
+
+use eframe::egui::text::{LayoutJob, TextFormat};
+use eframe::egui::{self, Color32, CornerRadius, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, Vec2, vec2};
+use eframe::epaint::Shadow;
 use sc_nav_geo::Cue;
 use sc_nav_geo::ground::{GroundLevel, GroundWarning};
 use sc_nav_geo::space::SpaceGuidance;
 use sc_nav_pilot::Snapshot;
 
 use crate::store::{Compass, Prefs};
-use crate::theme::{ALERT, WARN};
 
-/// Ours: one colour, apart from the ship HUD's amber and the visor's cyan.
-pub const MARK: Color32 = Color32::from_rgb(110, 230, 160);
-const SOFT: Color32 = Color32::from_rgb(215, 228, 220);
-const DIMMED: Color32 = Color32::from_rgb(150, 165, 158);
+/// Ours: one accent, apart from the ship HUD's amber and the visor's cyan.
+pub const MARK: Color32 = Color32::from_rgb(120, 232, 172);
+const TEXT: Color32 = Color32::from_rgb(236, 244, 248);
+const MUTED: Color32 = Color32::from_rgb(150, 176, 190);
+const AMBER: Color32 = Color32::from_rgb(246, 186, 76);
+const RED: Color32 = Color32::from_rgb(232, 64, 56);
 
 /// Click-through makes the window layered (`WS_EX_LAYERED`), and Windows
 /// shows nothing of a layered window until its attributes are set: full
@@ -44,44 +52,148 @@ pub fn show_layered(frame: &eframe::Frame) {
     let _ = frame;
 }
 
+/// One piece of a card's row: text in a slot at least `slot` wide, right
+/// aligned in it (numbers), or left (labels).
+struct Seg {
+    g: Arc<Galley>,
+    slot: f32,
+    right: bool,
+}
+
 struct Hud {
     p: Painter,
     r: Rect,
-    /// Seconds, for blinking.
+    /// Seconds, for pulsing.
     t: f64,
+    /// One point at 1080p.
+    u: f32,
+    ppp: f32,
 }
 
 impl Hud {
-    fn h(&self) -> f32 {
-        self.r.height()
+    fn snap(&self, v: f32) -> f32 {
+        (v * self.ppp).round() / self.ppp
     }
 
-    fn at(&self, x: f32, y_frac: f32) -> Pos2 {
-        Pos2::new(x, self.r.top() + y_frac * self.h())
+    fn snap_pos(&self, p: Pos2) -> Pos2 {
+        Pos2::new(self.snap(p.x), self.snap(p.y))
     }
 
-    fn blink(&self) -> bool {
-        (self.t * 3.0) as i64 % 2 == 0
+    /// 0..1, about once a second: for the alerts.
+    fn pulse(&self) -> f32 {
+        (0.5 + 0.5 * (self.t * std::f64::consts::TAU * 1.2).sin()) as f32
     }
 
-    /// Text with a dark halo, readable over sky and ground alike.
-    fn text(&self, pos: Pos2, anchor: Align2, s: &str, size_frac: f32, col: Color32) -> Rect {
-        let font = FontId::new(size_frac * self.h(), crate::theme::hud_font());
-        let halo = Color32::from_black_alpha(150);
-        for d in [vec2(1.0, 1.0), vec2(-1.0, 1.0), vec2(1.0, -1.0), vec2(-1.0, -1.0)] {
-            self.p.text(pos + d, anchor, s, font.clone(), halo);
+    fn text(&self, s: &str, size: f32, color: Color32, spacing: f32) -> Arc<Galley> {
+        let mut job = LayoutJob::default();
+        job.append(
+            s,
+            0.0,
+            TextFormat {
+                font_id: FontId::new((size * self.u).round(), crate::theme::hud_font()),
+                color,
+                extra_letter_spacing: spacing * self.u,
+                ..Default::default()
+            },
+        );
+        self.p.layout_job(job)
+    }
+
+    /// Small spaced capitals: names and labels.
+    fn label(&self, s: &str, size: f32, color: Color32) -> Arc<Galley> {
+        self.text(&s.to_uppercase(), size, color, 0.16 * size)
+    }
+
+    /// A galley on whole pixels, with a faint drop shadow so it holds over
+    /// bright sky.
+    fn put(&self, top_left: Pos2, g: &Arc<Galley>) {
+        let at = self.snap_pos(top_left);
+        let shadow = Color32::from_black_alpha(120);
+        self.p.galley_with_override_text_color(at + vec2(0.0, 1.0 / self.ppp), g.clone(), shadow);
+        self.p.galley(at, g.clone(), TEXT);
+    }
+
+    /// Centred on `cx`.
+    fn put_centred(&self, cx: f32, top: f32, g: &Arc<Galley>) {
+        self.put(Pos2::new(cx - g.size().x / 2.0, top), g);
+    }
+
+    /// A feathered darkening behind a block: no edge, just less glare.
+    fn scrim(&self, rect: Rect) {
+        let blur = (60.0 * self.u).min(255.0) as u8;
+        let shadow = Shadow { offset: [0, 0], blur, spread: 0, color: Color32::from_black_alpha(28) };
+        self.p.add(shadow.as_shape(rect, CornerRadius::same((10.0 * self.u) as u8)));
+    }
+
+    /// A line with a soft glow of its own colour.
+    fn glow(&self, pts: &[Pos2], width: f32, color: Color32, closed: bool) {
+        let make = |w: f32, c: Color32| {
+            let stroke = Stroke::new(w, c);
+            if closed { Shape::closed_line(pts.to_vec(), stroke) } else { Shape::line(pts.to_vec(), stroke) }
+        };
+        self.p.add(make(width + 7.0 * self.u, color.gamma_multiply(0.06)));
+        self.p.add(make(width + 3.5 * self.u, color.gamma_multiply(0.16)));
+        self.p.add(make(width, color));
+    }
+
+    fn ring(&self, c: Pos2, radius: f32, width: f32, color: Color32) {
+        self.p.circle_stroke(c, radius, Stroke::new(width + 5.0 * self.u, color.gamma_multiply(0.1)));
+        self.p.circle_stroke(c, radius, Stroke::new(width, color));
+    }
+
+    /// A chevron pointing along `dir` with its tip at `tip`.
+    fn chevron(&self, tip: Pos2, dir: Vec2, size: f32, color: Color32) {
+        let back = tip - dir * size * 0.8;
+        let side = vec2(-dir.y, dir.x) * size;
+        self.glow(&[back + side, tip, back - side], 2.0 * self.u, color, false);
+    }
+
+    /// A glass card: dark translucent fill, a hairline edge, an accent bar
+    /// on the left, then a row of segments. Centred on `cx`, top at `top`.
+    fn card(&self, cx: f32, top: f32, segs: &[Seg], bar: Color32, fill: Color32) -> Rect {
+        let u = self.u;
+        let (pad_l, pad_r, pad_y, gap) = (14.0 * u, 12.0 * u, 6.0 * u, 10.0 * u);
+        let row_h = segs.iter().map(|s| s.g.size().y).fold(0.0, f32::max);
+        let w = pad_l + segs.iter().map(|s| s.slot).sum::<f32>() + gap * segs.len().saturating_sub(1) as f32 + pad_r;
+        let rect = Rect::from_min_size(
+            self.snap_pos(Pos2::new(cx - w / 2.0, top)),
+            vec2(self.snap(w), self.snap(row_h + 2.0 * pad_y)),
+        );
+        let radius = CornerRadius::same((3.0 * u) as u8);
+        self.p.rect_filled(rect, radius, fill);
+        self.p.rect_stroke(rect, radius, Stroke::new(1.0 / self.ppp, Color32::from_rgba_unmultiplied(150, 205, 230, 60)), egui::StrokeKind::Inside);
+        let bar_rect = Rect::from_min_size(rect.min + vec2(4.0 * u, 4.0 * u), vec2(self.snap(3.0 * u), rect.height() - 8.0 * u));
+        self.p.rect_filled(bar_rect, 0.0, bar);
+        let mut x = rect.left() + pad_l;
+        for s in segs {
+            let gx = if s.right { x + s.slot - s.g.size().x } else { x };
+            let gy = rect.top() + pad_y + (row_h - s.g.size().y) / 2.0;
+            self.p.galley(self.snap_pos(Pos2::new(gx, gy)), s.g.clone(), TEXT);
+            x += s.slot + gap;
         }
-        self.p.text(pos, anchor, s, font, col)
+        rect
     }
 
-    fn polygon(&self, pts: Vec<Pos2>, col: Color32) {
-        self.p.add(Shape::convex_polygon(pts, col, Stroke::new(1.5, Color32::from_black_alpha(140))));
+    fn seg(g: Arc<Galley>) -> Seg {
+        Seg { slot: g.size().x, g, right: false }
     }
+
+    /// A number in a slot as wide as `template` at the same size.
+    fn num(&self, g: Arc<Galley>, template: &str, size: f32) -> Seg {
+        let slot = self.text(template, size, TEXT, 0.0).size().x.max(g.size().x);
+        Seg { g, slot, right: true }
+    }
+}
+
+/// The glass of a plain card.
+fn glass() -> Color32 {
+    Color32::from_rgba_unmultiplied(10, 28, 38, 165)
 }
 
 pub fn draw(ui: &mut egui::Ui, s: &Snapshot, prefs: &Prefs) {
     let ctx = ui.ctx().clone();
-    let hud = Hud { p: ui.painter().clone(), r: ctx.content_rect(), t: ctx.input(|i| i.time) };
+    let r = ctx.content_rect();
+    let hud = Hud { p: ui.painter().clone(), r, t: ctx.input(|i| i.time), u: r.height() / 1080.0, ppp: ctx.pixels_per_point() };
     let seated = s.instruments.is_some() && !s.on_foot;
     let compass = if seated { prefs.ship } else { prefs.foot };
 
@@ -95,7 +207,7 @@ pub fn draw(ui: &mut egui::Ui, s: &Snapshot, prefs: &Prefs) {
     }
     if prefs.debug {
         // top left, between the ship status and the compass: sky in a seat
-        let pos = Pos2::new(hud.r.left() + 0.18 * hud.r.width(), hud.r.top() + 0.02 * hud.h());
+        let pos = Pos2::new(r.left() + 0.18 * r.width(), r.top() + 0.02 * r.height());
         egui::Area::new(egui::Id::unique("debug-panel"))
             .fixed_pos(pos)
             .interactable(false)
@@ -103,94 +215,130 @@ pub fn draw(ui: &mut egui::Ui, s: &Snapshot, prefs: &Prefs) {
     }
 }
 
-/// The rows under the compass: offsets from the tape, fractions of height.
-const MARKER_DY: f32 = 0.026;
-const ROW1_DY: f32 = 0.048;
-const ROW2_DY: f32 = 0.068;
-const ROW1_SIZE: f32 = 0.016;
-const ROW2_SIZE: f32 = 0.014;
+/// Below the tape, in points at 1080p: the chevron's tip (clear of the
+/// game's heading number), then the block with name and readouts.
+const MARKER_DY: f32 = 22.0;
+const BLOCK_DY: f32 = 36.0;
 
 fn target(hud: &Hud, s: &Snapshot, c: &Compass, fov_deg: f32) {
-    let name = s.target.as_deref().unwrap_or_default().to_uppercase();
+    let name = s.target.as_deref().unwrap_or_default();
     let cx = hud.r.center().x;
-    let row1 = hud.at(cx, c.y + ROW1_DY);
-    let row2 = hud.at(cx, c.y + ROW2_DY);
+    let top = hud.r.top() + c.y * hud.r.height() + BLOCK_DY * hud.u;
     if s.target_space {
         let Some(g) = &s.space else {
-            hud.text(row1, Align2::CENTER_CENTER, &format!("{name}   NO POSITION"), ROW1_SIZE, WARN);
+            status(hud, cx, top, name, "no position");
             return;
         };
-        let col = if g.age_s > 5.0 { DIMMED } else { MARK };
-        hud.text(row1, Align2::CENTER_CENTER, &line(&name, g.distance_m, g.eta_s), ROW1_SIZE, col);
-        cue(hud, row2, g.cue, g.time_to_brake_s);
-        on_screen(hud, g, &name, fov_deg);
+        let bottom = info(hud, cx, top, name, g.distance_m, g.eta_s, g.age_s > 5.0);
+        cue(hud, cx, bottom + 10.0 * hud.u, g.cue, g.time_to_brake_s);
+        on_screen(hud, g, name, fov_deg);
         return;
     }
     let Some(g) = &s.guidance else {
         let why = if s.provisional {
-            "CALIBRATING".to_string()
+            "calibrating".to_string()
         } else if let Some(body) = &s.target_elsewhere {
-            format!("ON {}", body.to_uppercase())
+            format!("on {body}")
         } else if s.here.is_none() {
-            "NO POSITION".to_string()
+            "no position".to_string()
         } else {
-            "WAITING".to_string()
+            "waiting".to_string()
         };
-        hud.text(row1, Align2::CENTER_CENTER, &format!("{name}   {why}"), ROW1_SIZE, WARN);
+        status(hud, cx, top, name, &why);
         return;
     };
-    let col = if g.stale { DIMMED } else { MARK };
-    marker(hud, c, g.relative as f32, col);
-    hud.text(row1, Align2::CENTER_CENTER, &line(&name, g.distance_m, g.eta_s), ROW1_SIZE, col);
-    cue(hud, row2, g.cue, g.time_to_brake_s);
+    marker(hud, c, g.relative as f32, if g.stale { MUTED } else { MARK });
+    let bottom = info(hud, cx, top, name, g.distance_m, g.eta_s, g.stale);
+    cue(hud, cx, bottom + 10.0 * hud.u, g.cue, g.time_to_brake_s);
 }
 
-/// Under the tape at the target's bearing; beyond the tape, an arrow at its
+/// The target's name behind an accent bar, then two readouts either side of
+/// a hairline: distance (right aligned to it) and ETA (left aligned).
+/// Returns the block's bottom.
+fn info(hud: &Hud, cx: f32, top: f32, name: &str, distance_m: f64, eta_s: Option<f64>, stale: bool) -> f32 {
+    let u = hud.u;
+    let ink = if stale { MUTED } else { TEXT };
+    let title = hud.label(name, 12.0, ink);
+    let bar_w = 3.0 * u;
+    let tw = bar_w + 7.0 * u + title.size().x;
+    let tx = hud.snap(cx - tw / 2.0);
+    let bar = Rect::from_min_size(Pos2::new(tx, top + 1.0 * u), vec2(hud.snap(bar_w), title.size().y - 2.0 * u));
+    hud.p.rect_filled(bar, 0.0, if stale { MUTED } else { MARK });
+    hud.put(Pos2::new(tx + bar_w + 7.0 * u, top), &title);
+
+    let y = top + title.size().y + 6.0 * u;
+    let (value, unit) = split_distance(distance_m);
+    let gap = 14.0 * u;
+    let left = [hud.text(&value, 26.0, ink, 0.0), hud.label(unit, 9.5, MUTED)];
+    hud.put(Pos2::new(cx - gap - left[0].size().x, y), &left[0]);
+    let label_y = y + left[0].size().y - 2.0 * u;
+    hud.put(Pos2::new(cx - gap - left[1].size().x, label_y), &left[1]);
+    let mut bottom = label_y + left[1].size().y;
+    if let Some(t) = eta_s {
+        let right = [hud.text(&clock(t), 26.0, ink, 0.0), hud.label("eta", 9.5, MUTED)];
+        hud.put(Pos2::new(cx + gap, y), &right[0]);
+        hud.put(Pos2::new(cx + gap, label_y), &right[1]);
+        let x = hud.snap(cx) + 0.5 / hud.ppp;
+        hud.p.line_segment([Pos2::new(x, y + 4.0 * u), Pos2::new(x, bottom - 2.0 * u)], Stroke::new(1.0 / hud.ppp, Color32::from_white_alpha(70)));
+    }
+    bottom = bottom.max(label_y);
+    hud.scrim(Rect::from_min_max(Pos2::new(cx - 110.0 * u, top), Pos2::new(cx + 110.0 * u, bottom)));
+    bottom
+}
+
+fn status(hud: &Hud, cx: f32, top: f32, name: &str, why: &str) {
+    let title = hud.label(name, 12.0, TEXT);
+    hud.put_centred(cx, top, &title);
+    let segs = [Hud::seg(hud.label(why, 11.0, AMBER))];
+    hud.card(cx, top + title.size().y + 8.0 * hud.u, &segs, AMBER, glass());
+}
+
+/// Under the tape at the target's bearing; beyond the tape, sideways at its
 /// end with the turn.
-fn marker(hud: &Hud, c: &Compass, rel: f32, col: Color32) {
-    let h = hud.h();
+fn marker(hud: &Hud, c: &Compass, rel: f32, color: Color32) {
+    let h = hud.r.height();
     let (cx, ty) = (hud.r.center().x, hud.r.top() + c.y * h);
     let ppd = c.per_deg * h;
-    let size = 0.008 * h;
+    let size = 7.0 * hud.u;
     if rel.abs() <= c.span {
-        let (x, tip) = (cx + rel * ppd, ty + MARKER_DY * h - size);
-        hud.polygon(
-            vec![Pos2::new(x, tip), Pos2::new(x + size, tip + 1.4 * size), Pos2::new(x - size, tip + 1.4 * size)],
-            col,
-        );
+        let tip = hud.snap_pos(Pos2::new(cx + rel * ppd, ty + MARKER_DY * hud.u));
+        hud.chevron(tip, vec2(0.0, -1.0), size, color);
         return;
     }
     let side = rel.signum();
-    let x = cx + side * (c.span * ppd + 0.012 * h);
-    let back = x - side * 1.4 * size;
-    hud.polygon(vec![Pos2::new(x, ty), Pos2::new(back, ty + size), Pos2::new(back, ty - size)], col);
-    let anchor = if side > 0.0 { Align2::LEFT_CENTER } else { Align2::RIGHT_CENTER };
-    hud.text(Pos2::new(x + side * 0.008 * h, ty), anchor, &format!("{:.0}°", rel.abs()), ROW1_SIZE, col);
-}
-
-fn line(name: &str, distance_m: f64, eta_s: Option<f64>) -> String {
-    let eta = eta_s.map_or(String::new(), |t| format!("   {}", clock(t)));
-    format!("{name}   {}{eta}", distance(distance_m))
+    let tip = hud.snap_pos(Pos2::new(cx + side * (c.span * ppd + 16.0 * hud.u), ty));
+    hud.chevron(tip, vec2(side, 0.0), size, color);
+    let g = hud.text(&format!("{:.0}°", rel.abs()), 18.0, color, 0.0);
+    let x = if side > 0.0 { tip.x + 8.0 * hud.u } else { tip.x - 8.0 * hud.u - g.size().x };
+    hud.put(Pos2::new(x, ty - g.size().y / 2.0), &g);
 }
 
 /// The braking cue, only while it matters.
-fn cue(hud: &Hud, pos: Pos2, cue: Cue, time_to_brake_s: Option<f64>) {
-    let (text, col) = match (cue, time_to_brake_s) {
-        (Cue::Cruise, Some(t)) if t < 90.0 => (format!("BRAKE IN {}", clock(t)), SOFT),
-        (Cue::Prepare, t) => (format!("BRAKE IN {}", t.map_or("0:00".into(), clock)), WARN),
-        (Cue::Brake, _) => ("BRAKE NOW".into(), if hud.blink() { ALERT } else { WARN }),
-        (Cue::Arrived, _) => ("ARRIVED".into(), MARK),
-        _ => return,
+fn cue(hud: &Hud, cx: f32, top: f32, cue: Cue, time_to_brake_s: Option<f64>) {
+    let timed = |label_color: Color32, bar: Color32, t: f64| {
+        let segs = [Hud::seg(hud.label("brake in", 11.0, label_color)), hud.num(hud.text(&clock(t), 16.0, TEXT, 0.0), "8:88", 16.0)];
+        hud.card(cx, top, &segs, bar, glass());
     };
-    hud.text(pos, Align2::CENTER_CENTER, &text, ROW2_SIZE, col);
+    match (cue, time_to_brake_s) {
+        (Cue::Cruise, Some(t)) if t < 90.0 => timed(MUTED, MUTED, t),
+        (Cue::Prepare, t) => timed(AMBER, AMBER, t.unwrap_or(0.0)),
+        (Cue::Brake, _) => {
+            let fill = Color32::from_rgba_unmultiplied(150, 30, 26, (150.0 + 80.0 * hud.pulse()) as u8);
+            hud.card(cx, top, &[Hud::seg(hud.label("brake now", 13.0, TEXT))], RED, fill);
+        }
+        (Cue::Arrived, _) => {
+            hud.card(cx, top, &[Hud::seg(hud.label("arrived", 12.0, TEXT))], MARK, glass());
+        }
+        _ => {}
+    }
 }
 
-/// A space target where it is on screen, from the view angles: a diamond
-/// with its distance, or an arrow at the screen's edge with the turn. The
-/// ring is where the ship is moving.
+/// A space target where it is on screen, from the view angles: a thin
+/// diamond with its name and distance under it, or a chevron at the
+/// screen's edge with the turn. The ring is where the ship is moving.
 fn on_screen(hud: &Hud, g: &SpaceGuidance, name: &str, fov_deg: f32) {
     let Some((right, up)) = g.target_view else { return };
-    let h = hud.h();
+    let (h, u) = (hud.r.height(), hud.u);
     let f = (h / 2.0) / (fov_deg.to_radians() / 2.0).tan();
     let c = hud.r.center();
     let project = |(r, u): (f64, f64)| {
@@ -198,75 +346,88 @@ fn on_screen(hud: &Hud, g: &SpaceGuidance, name: &str, fov_deg: f32) {
         let (dr, du, df) = (u.cos() * r.sin(), u.sin(), u.cos() * r.cos());
         (df > 0.05).then(|| Pos2::new(c.x + (dr / df) as f32 * f, c.y - (du / df) as f32 * f))
     };
-    let inner = hud.r.shrink(0.05 * h);
-    let size = 0.010 * h;
+    let inner = hud.r.shrink(0.07 * h);
+    let size = 9.0 * u;
     if let Some(p) = project((right, up)).filter(|p| inner.contains(*p)) {
+        let p = hud.snap_pos(p);
         let d = |x: f32, y: f32| Pos2::new(p.x + x, p.y + y);
-        hud.p.add(Shape::closed_line(
-            vec![d(0.0, -size), d(size, 0.0), d(0.0, size), d(-size, 0.0)],
-            Stroke::new(2.5, MARK),
-        ));
-        hud.text(d(0.0, size + 0.012 * h), Align2::CENTER_CENTER, &distance(g.distance_m), ROW2_SIZE, MARK);
+        hud.glow(&[d(0.0, -size), d(size, 0.0), d(0.0, size), d(-size, 0.0)], 1.5 * u, MARK, true);
+        let title = hud.label(name, 11.0, TEXT);
+        let dist = hud.text(&distance(g.distance_m), 12.0, MUTED, 0.3);
+        let y = p.y + size + 8.0 * u;
+        hud.put_centred(p.x, y, &title);
+        hud.put_centred(p.x, y + title.size().y + 1.0 * u, &dist);
     } else {
         // the direction on screen, pushed to the inner edge
-        let (r, u) = (right.to_radians() as f32, up.to_radians() as f32);
-        let raw = vec2(r.sin(), -u.sin());
+        let (r, up_r) = (right.to_radians() as f32, up.to_radians() as f32);
+        let raw = vec2(r.sin(), -up_r.sin());
         let dir = if raw.length() > 1e-4 { raw.normalized() } else { vec2(1.0, 0.0) };
         let k = ((inner.width() / 2.0) / dir.x.abs()).min((inner.height() / 2.0) / dir.y.abs());
-        let tip = c + dir * k;
-        let back = tip - dir * 1.4 * size;
-        let side = vec2(-dir.y, dir.x) * size;
-        hud.polygon(vec![tip, back + side, back - side], MARK);
+        let tip = hud.snap_pos(c + dir * k);
+        hud.chevron(tip, dir, size, MARK);
         let off = (right.to_radians().cos() * up.to_radians().cos()).clamp(-1.0, 1.0).acos().to_degrees();
-        hud.text(back - dir * 0.03 * h, Align2::CENTER_CENTER, &format!("{name}  {off:.0}°"), ROW2_SIZE, MARK);
+        let at = tip - dir * 46.0 * u;
+        let title = hud.label(name, 11.0, TEXT);
+        let deg = hud.text(&format!("{off:.0}°"), 16.0, MARK, 0.0);
+        hud.put_centred(at.x, at.y - title.size().y, &title);
+        hud.put_centred(at.x, at.y + 1.0 * u, &deg);
     }
     if let Some(p) = g.travel_view.and_then(project).filter(|p| inner.contains(*p)) {
-        hud.p.circle_stroke(p, 0.006 * h, Stroke::new(2.0, MARK.gamma_multiply(0.8)));
+        hud.ring(hud.snap_pos(p), 6.0 * u, 1.5 * u, MARK.gamma_multiply(0.85));
     }
 }
 
 fn ground(hud: &Hud, w: &GroundWarning) {
-    let c = hud.at(hud.r.center().x, 0.62);
+    let u = hud.u;
+    let (cx, top) = (hud.r.center().x, hud.r.top() + 0.6 * hud.r.height());
+    let impact = |label_color: Color32| {
+        [Hud::seg(hud.label("impact", 11.0, label_color)), hud.num(hud.text(&clock(w.time_to_impact_s), 16.0, TEXT, 0.0), "8:88", 16.0)]
+    };
     match w.level {
         GroundLevel::PullUp => {
-            let col = if hud.blink() { ALERT } else { WARN };
-            let r = hud.text(c, Align2::CENTER_CENTER, "PULL UP", 0.048, col);
-            let below = Pos2::new(c.x, r.bottom() + 0.016 * hud.h());
-            hud.text(below, Align2::CENTER_CENTER, &format!("IMPACT {}", clock(w.time_to_impact_s)), 0.018, col);
+            let fill = Color32::from_rgba_unmultiplied(160, 30, 26, (160.0 + 80.0 * hud.pulse()) as u8);
+            let rect = hud.card(cx, top, &[Hud::seg(hud.label("pull up", 30.0, TEXT))], Color32::WHITE, fill);
+            hud.card(cx, rect.bottom() + 6.0 * u, &impact(MUTED), RED, glass());
         }
         GroundLevel::Caution => {
-            let r = hud.text(c, Align2::CENTER_CENTER, &format!("SINK {:.0} M/S", w.sink), 0.024, WARN);
-            let below = Pos2::new(c.x, r.bottom() + 0.014 * hud.h());
-            hud.text(below, Align2::CENTER_CENTER, &format!("IMPACT {}", clock(w.time_to_impact_s)), 0.016, WARN);
+            let mut segs = vec![Hud::seg(hud.label("sink", 11.0, AMBER)), hud.num(hud.text(&format!("{:.0} m/s", w.sink), 16.0, TEXT, 0.0), "888 m/s", 16.0)];
+            segs.extend(impact(MUTED));
+            hud.card(cx, top, &segs, AMBER, glass());
         }
     }
 }
 
-/// While adjusting: a marker straight ahead and two at ±20°, ticks where the
-/// tape should end, and sample rows.
+/// While adjusting: a chevron straight ahead and two at ±20°, ticks where
+/// the tape should end, and the sample block.
 fn preview(hud: &Hud, c: &Compass) {
-    let h = hud.h();
+    let h = hud.r.height();
     let (cx, ty) = (hud.r.center().x, hud.r.top() + c.y * h);
     for side in [-1.0, 1.0] {
-        let x = cx + side * c.span * c.per_deg * h;
-        hud.p.line_segment([Pos2::new(x, ty - 0.012 * h), Pos2::new(x, ty + 0.012 * h)], Stroke::new(2.0, WARN));
+        let x = hud.snap(cx + side * c.span * c.per_deg * h);
+        hud.glow(&[Pos2::new(x, ty - 10.0 * hud.u), Pos2::new(x, ty + 10.0 * hud.u)], 2.0 * hud.u, AMBER, false);
     }
     for deg in [-20.0, 20.0] {
         marker(hud, c, deg, MARK.gamma_multiply(0.5));
     }
     marker(hud, c, 0.0, MARK);
-    hud.text(hud.at(cx, c.y + ROW1_DY), Align2::CENTER_CENTER, &line("PREVIEW", 1200.0, Some(42.0)), ROW1_SIZE, MARK);
-    hud.text(hud.at(cx, c.y + ROW2_DY), Align2::CENTER_CENTER, "BRAKE IN 0:30", ROW2_SIZE, SOFT);
+    let bottom = info(hud, cx, ty + BLOCK_DY * hud.u, "preview", 1200.0, Some(42.0), false);
+    cue(hud, cx, bottom + 10.0 * hud.u, Cue::Cruise, Some(30.0));
+}
+
+/// The number and its unit, apart: `("22.5", "km")`.
+fn split_distance(m: f64) -> (String, &'static str) {
+    if m >= 10_000.0 {
+        (format!("{:.1}", m / 1000.0), "km")
+    } else if m >= 1000.0 {
+        (format!("{:.2}", m / 1000.0), "km")
+    } else {
+        (format!("{m:.0}"), "m")
+    }
 }
 
 fn distance(m: f64) -> String {
-    if m >= 10_000.0 {
-        format!("{:.1} KM", m / 1000.0)
-    } else if m >= 1000.0 {
-        format!("{:.2} KM", m / 1000.0)
-    } else {
-        format!("{m:.0} M")
-    }
+    let (v, unit) = split_distance(m);
+    format!("{v} {unit}")
 }
 
 /// `m:ss`, or `h:mm:ss` from an hour.

@@ -12,6 +12,7 @@
 //!
 //!   `sc-nav`          # needs the game's telemetry: GRPC_CLIENT_SERVER_ENABLED=true
 //!   `sc-nav --demo`   # a simulated flight on Lyria, no game
+//!   `sc-nav --demo --backdrop shot.png`   # over a screenshot, to judge the look
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -48,6 +49,18 @@ struct App {
     control_pos: [f32; 2],
     demo: bool,
     layered: bool,
+    /// A screenshot painted under the HUD (previews only).
+    backdrop: Option<egui::TextureHandle>,
+}
+
+/// `--backdrop <image>`: a screenshot as the HUD's background.
+fn backdrop(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.iter().position(|a| a == "--backdrop").and_then(|i| args.get(i + 1))?;
+    let img = image::open(path).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("backdrop", color, egui::TextureOptions::LINEAR))
 }
 
 fn main() -> Result<()> {
@@ -91,6 +104,7 @@ fn main() -> Result<()> {
                 control_pos,
                 demo,
                 layered: false,
+                backdrop: backdrop(&cc.egui_ctx),
             }))
         }),
     )
@@ -208,6 +222,10 @@ impl eframe::App for App {
                 Err(TryRecvError::Disconnected) => self.phase = Phase::Failed("the loader stopped".into()),
                 Err(TryRecvError::Empty) => {}
             }
+        }
+        if let Some(tex) = &self.backdrop {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(tex.id(), ctx.content_rect(), uv, egui::Color32::WHITE);
         }
         if let Phase::Running { rt } = &self.phase {
             // keep ages and the blinking cue ticking without telemetry
