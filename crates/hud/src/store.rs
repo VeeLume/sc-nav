@@ -36,6 +36,11 @@ impl Store {
         self.root.join("marks.json")
     }
 
+    /// The app's own settings ([`Prefs`]).
+    pub fn prefs(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+
     /// Measured phases per body, refined by every overlay fix.
     pub fn phases(&self) -> PathBuf {
         self.root.join("phases.json")
@@ -49,4 +54,26 @@ pub const LAB_MARKS: &str = r"E:\vscode\sc-grpc\.scratch\nav-data\waypoints.json
 pub fn read_marks(path: &Path) -> Result<BTreeMap<String, Location>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// What the user sets in the app. Unknown or missing fields fall back to
+/// the defaults, so old files keep loading.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Prefs {
+    /// The HUD also shows what the game already shows and what only helps
+    /// finding a fault.
+    pub debug: bool,
+}
+
+impl Prefs {
+    pub fn load(path: &Path) -> Self {
+        std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) {
+        if let Ok(b) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, b);
+        }
+    }
 }

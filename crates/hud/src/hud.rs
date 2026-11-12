@@ -31,29 +31,40 @@ pub fn show_layered(frame: &eframe::Frame) {
     let _ = frame;
 }
 
-pub fn draw(ui: &mut egui::Ui, s: &Snapshot) {
+/// `debug` adds what the game already shows or what only helps finding a
+/// fault: the instruments, the link, the fix source, the raw bearing.
+pub fn draw(ui: &mut egui::Ui, s: &Snapshot, debug: bool) {
     let stale = s.frame_ms.is_none_or(|f| s.ms - f > 2000);
+    // without debug the strip shows only while there is something to act on
+    if !debug && s.target.is_none() && s.ground.is_none() {
+        return;
+    }
     egui::Frame::new()
         .fill(glass())
         .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.25)))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(12.0)
         .show(ui, |ui| {
-            ui.set_min_size(egui::vec2(W - 26.0, H - 26.0));
-            header(ui, s, stale);
-            ui.add_space(2.0);
-            match &s.instruments {
-                Some(i) => instruments(ui, i, stale),
-                None => {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::hover());
-                    let text = if s.on_foot { "on foot" } else { "no vehicle telemetry" };
-                    ui.painter().text(r.left_center(), Align2::LEFT_CENTER, text, FontId::proportional(15.0), DIM);
+            ui.set_min_width(W - 26.0);
+            if debug {
+                ui.set_min_height(H - 26.0);
+                header(ui, s, stale);
+                ui.add_space(2.0);
+                match &s.instruments {
+                    Some(i) => instruments(ui, i, stale),
+                    None => {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::hover());
+                        let text = if s.on_foot { "on foot" } else { "no vehicle telemetry" };
+                        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, text, FontId::proportional(15.0), DIM);
+                    }
                 }
             }
-            ground(ui, s);
-            steering(ui, s);
-            ui.add_space(2.0);
-            fix_line(ui, s);
+            ground(ui, s, debug);
+            steering(ui, s, debug);
+            if debug {
+                ui.add_space(2.0);
+                fix_line(ui, s);
+            }
         });
 }
 
@@ -98,9 +109,9 @@ fn instruments(ui: &mut egui::Ui, i: &Instruments, stale: bool) {
 }
 
 /// The steering line: a tape on a body, a view box in space.
-fn steering(ui: &mut egui::Ui, s: &Snapshot) {
+fn steering(ui: &mut egui::Ui, s: &Snapshot, debug: bool) {
     if s.target_space {
-        return space(ui, s);
+        return space(ui, s, debug);
     }
     let Some(g) = &s.guidance else {
         let msg = match (&s.target, &s.target_elsewhere) {
@@ -108,18 +119,24 @@ fn steering(ui: &mut egui::Ui, s: &Snapshot) {
             (Some(name), Some(body)) => format!("{name} is on {body}, not here"),
             (Some(name), None) if s.here.is_none() => format!("{name} · waiting for a position fix"),
             (Some(name), None) => format!("{name} · waiting for telemetry"),
-            (None, _) => "no target · mark or pick one in the control window".into(),
+            (None, _) if debug => "no target · mark or pick one in the control window".into(),
+            (None, _) => return,
         };
         let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::hover());
         ui.painter().text(r.center(), Align2::CENTER_CENTER, msg, FontId::proportional(14.0), DIM);
         return;
     };
-    tape(ui, g, s.track);
+    tape(ui, g, s.track, debug);
     ui.horizontal(|ui| {
         let eta = g.eta_s.map_or("--".into(), fmt_time);
-        let xtk = g.cross_track_m.map_or(String::new(), |x| format!(" · xtk {x:+.0} m"));
+        let extra = if debug {
+            let xtk = g.cross_track_m.map_or(String::new(), |x| format!(" · xtk {x:+.0} m"));
+            format!(" · gs {:.0}{xtk}", g.ground_speed)
+        } else {
+            String::new()
+        };
         ui.label(
-            RichText::new(format!("{} · {} · ETA {eta} · gs {:.0}{xtk}", s.target.as_deref().unwrap_or("?"), fmt_km(g.distance_m), g.ground_speed))
+            RichText::new(format!("{} · {} · ETA {eta}{extra}", s.target.as_deref().unwrap_or("?"), fmt_km(g.distance_m)))
                 .color(INK)
                 .size(13.0),
         );
@@ -129,7 +146,7 @@ fn steering(ui: &mut egui::Ui, s: &Snapshot) {
 
 /// Nose at the centre, the target bearing as a triangle (pinned at the edge
 /// beyond ±60°), the direction of travel as a dot.
-fn tape(ui: &mut egui::Ui, g: &Guidance, track: Option<f64>) {
+fn tape(ui: &mut egui::Ui, g: &Guidance, track: Option<f64>, debug: bool) {
     const SPAN: f32 = 60.0;
     let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 36.0), egui::Sense::hover());
     let p = ui.painter();
@@ -168,7 +185,9 @@ fn tape(ui: &mut egui::Ui, g: &Guidance, track: Option<f64>) {
     };
     let (anchor, x) = if rel >= 0.0 { (Align2::LEFT_CENTER, cx + half + 10.0) } else { (Align2::RIGHT_CENTER, cx - half - 10.0) };
     p.text(Pos2::new(x, y), anchor, turn, FontId::monospace(size), col);
-    p.text(Pos2::new(cx - half, r.bottom()), Align2::LEFT_BOTTOM, format!("BRG {:03.0}", g.bearing), FontId::monospace(11.0), DIM);
+    if debug {
+        p.text(Pos2::new(cx - half, r.bottom()), Align2::LEFT_BOTTOM, format!("BRG {:03.0}", g.bearing), FontId::monospace(11.0), DIM);
+    }
 }
 
 fn cue_box(ui: &mut egui::Ui, cue: Cue, time_to_brake_s: Option<f64>, stale: bool) {
@@ -234,7 +253,7 @@ fn fmt_alt(m: f32) -> String {
 /// Steering to a point in space: a view box (crosshair = where you look,
 /// dot = the target, ring = where you're moving), the turn in words, the
 /// line with distance and closing speed, the cue.
-fn space(ui: &mut egui::Ui, s: &Snapshot) {
+fn space(ui: &mut egui::Ui, s: &Snapshot, debug: bool) {
     let name = s.target.as_deref().unwrap_or("?");
     let Some(g) = &s.space else {
         let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 58.0), egui::Sense::hover());
@@ -256,12 +275,17 @@ fn space(ui: &mut egui::Ui, s: &Snapshot) {
                 None => ("no view · needs r_DisplayInfo 2".to_string(), DIM),
             };
             ui.label(RichText::new(text).font(FontId::monospace(20.0)).color(col));
-            let track = g.track_error.map_or(String::new(), |e| format!(" · travel {e:.0}° off"));
+            let track = match g.track_error {
+                Some(e) if debug => format!(" · travel {e:.0}° off"),
+                _ => String::new(),
+            };
             let eta = g.eta_s.map_or("--".into(), fmt_time);
             ui.label(RichText::new(format!("{name} · {} · ETA {eta} · closing {:.0} m/s{track}", fmt_km(g.distance_m), g.closing)).color(INK).size(13.0));
             ui.horizontal(|ui| {
                 cue_box(ui, g.cue, g.time_to_brake_s, g.age_s > 5.0);
-                ui.label(RichText::new(format!("speed {:.0} m/s", g.speed)).color(DIM).size(12.0));
+                if debug {
+                    ui.label(RichText::new(format!("speed {:.0} m/s", g.speed)).color(DIM).size(12.0));
+                }
             });
         });
     });
@@ -293,9 +317,11 @@ fn view_box(ui: &mut egui::Ui, target: Option<(f64, f64)>, travel: Option<(f64, 
 
 /// The ground warning, above everything else that steers: it is the one
 /// thing that kills. Takes its space always, so the strip doesn't jump.
-fn ground(ui: &mut egui::Ui, s: &Snapshot) {
+fn ground(ui: &mut egui::Ui, s: &Snapshot, debug: bool) {
     let Some(w) = &s.ground else {
-        ui.add_space(24.0);
+        if debug {
+            ui.add_space(24.0);
+        }
         return;
     };
     let blink = (ui.input(|i| i.time) * 4.0) as i64 % 2 == 0;

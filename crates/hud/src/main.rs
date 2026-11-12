@@ -30,7 +30,7 @@ use sc_nav_geo::World;
 use sc_nav_pilot::runtime::{Config, Runtime};
 use sc_nav_pilot::{Director, Pilot, load_phases, telemetry};
 
-use store::Store;
+use store::{Prefs, Store};
 use theme::{ACCENT, ALERT, DIM, INK};
 
 /// HUD position: fraction of the screen height from the top.
@@ -45,6 +45,7 @@ enum Phase {
 struct App {
     phase: Phase,
     store: Store,
+    prefs: Prefs,
     control: control::Control,
     control_pos: [f32; 2],
     demo: bool,
@@ -83,6 +84,7 @@ fn main() -> Result<()> {
             });
             Ok(Box::new(App {
                 phase: Phase::Loading { rx, since: Instant::now() },
+                prefs: Prefs::load(&store.prefs()),
                 store,
                 control: control::Control::new(demo),
                 control_pos,
@@ -147,7 +149,7 @@ impl App {
             match &self.phase {
                 Phase::Running { rt } => {
                     let snap = rt.pilot().snapshot();
-                    self.control.ui(ui, rt, &snap, &self.store);
+                    self.control.ui(ui, rt, &snap, &self.store, &mut self.prefs);
                 }
                 Phase::Loading { since, .. } => {
                     let secs = since.elapsed().as_secs();
@@ -215,7 +217,7 @@ impl eframe::App for App {
                 p.tick(now);
                 p.snapshot()
             };
-            hud::draw(ui, &snap);
+            hud::draw(ui, &snap, self.prefs.debug);
         }
         self.control_window(&ctx);
     }

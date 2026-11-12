@@ -11,7 +11,7 @@ use sc_nav_geo::space::{norm, sub};
 use sc_nav_pilot::runtime::{Runtime, sessions};
 use sc_nav_pilot::{Cmd, Link, Snapshot, pretty};
 
-use crate::store::{LAB_MARKS, Store, read_marks};
+use crate::store::{LAB_MARKS, Prefs, Store, read_marks};
 use crate::theme::{ACCENT, ALERT, DIM, INK, LINE, OK, WARN, card, dot, fmt_km, fmt_time};
 
 #[derive(PartialEq, Clone, Copy)]
@@ -69,7 +69,7 @@ impl Control {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &Runtime, s: &Snapshot, store: &Store) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, rt: &Runtime, s: &Snapshot, store: &Store, prefs: &mut Prefs) {
         let replaying = rt.replay_state(|r| r.is_some());
         egui::Panel::bottom("status")
             .frame(egui::Frame::new().fill(crate::theme::BG).inner_margin(egui::Margin::symmetric(12, 6)))
@@ -112,7 +112,7 @@ impl Control {
                     Tab::Navigate => self.navigate(ui, rt, s, replaying),
                     Tab::Marks => self.marks(ui, rt, s, replaying),
                     Tab::Record => self.record(ui, rt, store, replaying),
-                    Tab::Settings => self.settings(ui, rt, store),
+                    Tab::Settings => self.settings(ui, rt, store, prefs),
                 }
                 ui.add_space(8.0);
                 card(ui, "Log", |ui| {
@@ -414,7 +414,18 @@ impl Control {
         }
     }
 
-    fn settings(&mut self, ui: &mut egui::Ui, rt: &Runtime, store: &Store) {
+    fn settings(&mut self, ui: &mut egui::Ui, rt: &Runtime, store: &Store, prefs: &mut Prefs) {
+        card(ui, "HUD", |ui| {
+            if ui.checkbox(&mut prefs.debug, "Debug details").changed() {
+                prefs.save(&store.prefs());
+            }
+            ui.label(
+                RichText::new("Adds the game's own instruments, the telemetry link, where the position came from and the raw bearing. Off, the HUD shows only while there is a target or a ground warning.")
+                    .color(DIM)
+                    .size(12.0),
+            );
+        });
+        ui.add_space(6.0);
         card(ui, "Inputs", |ui| {
             if self.demo {
                 ui.label(RichText::new("Demo: a simulated flight on Lyria, no game.").color(WARN));
