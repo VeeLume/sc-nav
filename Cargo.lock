@@ -3477,6 +3477,7 @@ dependencies = [
  "sc-extract",
  "sc-items",
  "sc-items-ship-components",
+ "sc-locations",
  "sc-vehicles",
  "serde",
 ]
@@ -3515,6 +3516,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sc-locations"
+version = "0.0.0"
+source = "git+https://github.com/VeeLume/sc-holotable.git?tag=sc-holotable%2Fv0.47.0#e90417afaeb737a67c2488af6bd26994ef91ba6e"
+dependencies = [
+ "sc-extract",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "sc-nav-capture"
 version = "0.1.0"
 dependencies = [
@@ -3537,8 +3548,10 @@ name = "sc-nav-data"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "sc-extract",
  "sc-holotable",
  "sc-nav-geo",
+ "serde",
  "serde_json",
 ]
 

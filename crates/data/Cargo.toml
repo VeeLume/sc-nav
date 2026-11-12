@@ -11,9 +11,13 @@ repository.workspace = true
 sc-nav-geo = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 sc-holotable = { git = "https://github.com/VeeLume/sc-holotable.git", tag = "sc-holotable/v0.47.0", default-features = false, features = [
     "installs",
     "items",
     "vehicles",
     "ship-components",
+    "locations",
 ] }
+# the systems' galactic positions (SSolarSystem records), same tag
+sc-extract = { git = "https://github.com/VeeLume/sc-holotable.git", tag = "sc-holotable/v0.47.0", default-features = false, features = ["ssolarsystem"] }

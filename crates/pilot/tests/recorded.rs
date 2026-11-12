@@ -32,6 +32,7 @@ fn world() -> Option<World> {
         build: "lab".into(),
         bodies: serde_json::from_value(v["bodies"].clone()).ok()?,
         ships: serde_json::from_value(v["ships"].clone()).ok()?,
+        systems: vec![],
     })
 }
 
@@ -128,6 +129,7 @@ fn record_and_replay_round_trip() {
         build: "test".into(),
         bodies: vec![lyria()],
         ships: Default::default(),
+        systems: vec![],
     };
     let start = sc_nav_clock::now_ms();
     let pilot = Pilot::new(Director::new(world.clone(), None), start);

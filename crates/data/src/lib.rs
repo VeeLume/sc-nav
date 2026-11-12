@@ -23,7 +23,10 @@ use sc_holotable::install::{Installation, discover_primary};
 use sc_holotable::items::Items;
 use sc_holotable::ship_components::ShipComponents;
 use sc_holotable::vehicles::{Flight, PortContainers, Vehicles, port_axes};
-use sc_nav_geo::{Body, Ship, World};
+use sc_nav_geo::{Body, Ship, System, World};
+
+/// Bumped when [`World`] gains what an older cache lacks.
+const CACHE: u32 = 2;
 
 /// The world and the overlay font from the primary install. Everything is
 /// cached in `cache_dir` per exact build (`world-<channel>-<version>.json` and
@@ -33,7 +36,7 @@ pub fn load(cache_dir: &Path) -> Result<(World, Vec<u8>)> {
     let install = discover_primary().context("finding the Star Citizen install")?;
     let key = cache_key(&install);
     let (world_file, font_file) = (
-        cache_dir.join(format!("world-{key}.json")),
+        cache_dir.join(format!("world{CACHE}-{key}.json")),
         cache_dir.join(format!("font-{key}.ttf")),
     );
     if let (Some(world), Ok(font)) = (
@@ -47,11 +50,12 @@ pub fn load(cache_dir: &Path) -> Result<(World, Vec<u8>)> {
     let assets = AssetSource::from_install(&install).context("opening Data.p4k")?;
     let bodies = bodies(&assets)?;
     let font = overlay_font(&assets)?;
-    let ships = ships(&install)?;
+    let (ships, systems) = records(&install)?;
     let world = World {
         build: build_of(&install),
         bodies,
         ships,
+        systems,
     };
     std::fs::create_dir_all(cache_dir)?;
     std::fs::write(&world_file, serde_json::to_vec(&world)?)?;
@@ -92,22 +96,47 @@ pub fn overlay_font(assets: &AssetSource) -> Result<Vec<u8>> {
 /// Every ship's flight figures with its stock loadout. Runs on its own
 /// thread with a large stack: the DataCore walk overflows Windows' 1 MB main
 /// stack.
-pub fn ships(install: &Installation) -> Result<BTreeMap<String, Ship>> {
+pub fn records(install: &Installation) -> Result<(BTreeMap<String, Ship>, Vec<System>)> {
     let install = install.clone();
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || ships_inner(&AssetSource::from_install(&install)?))?
+        .spawn(move || records_inner(&AssetSource::from_install(&install)?))?
         .join()
-        .map_err(|_| anyhow::anyhow!("ship extraction panicked"))?
+        .map_err(|_| anyhow::anyhow!("DataCore extraction panicked"))?
 }
 
-fn ships_inner(assets: &AssetSource) -> Result<BTreeMap<String, Ship>> {
+fn records_inner(assets: &AssetSource) -> Result<(BTreeMap<String, Ship>, Vec<System>)> {
     let data = AssetData::extract(assets, &AssetConfig::standard())?;
     let datacore = Datacore::parse(assets, &data)?;
+    Ok((ships(assets, &datacore)?, systems(&datacore)))
+}
+
+/// The star systems and their galactic positions (`SSolarSystem`). The id is
+/// the record's `name` lowercased, which is the object containers' folder
+/// (`stanton`, `pyro`, `nyx`): the id bodies carry.
+pub fn systems(datacore: &Datacore) -> Vec<System> {
+    let store = datacore.records();
+    let pools = &store.pools;
+    let mut out: Vec<System> = store
+        .records
+        .multi_feature
+        .ssolar_system
+        .values()
+        .filter_map(|h| h.get(pools))
+        .map(|s| System {
+            id: s.name.to_ascii_lowercase(),
+            galactic: s.galactic_position.and_then(|h| h.get(pools)).map(|v| [v.x as f64, v.y as f64, v.z as f64]),
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+fn ships(assets: &AssetSource, datacore: &Datacore) -> Result<BTreeMap<String, Ship>> {
     let items = Items::build(datacore.records());
-    let containers = PortContainers::build(&datacore, assets);
-    let vehicles = Vehicles::build(&datacore, &items, &containers, assets);
-    let components = ShipComponents::build(&datacore, &items);
+    let containers = PortContainers::build(datacore, assets);
+    let vehicles = Vehicles::build(datacore, &items, &containers, assets);
+    let components = ShipComponents::build(datacore, &items);
     let names: HashMap<Guid, String> = datacore
         .db()
         .all_records()

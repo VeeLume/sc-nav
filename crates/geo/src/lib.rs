@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod ground;
 pub mod location;
+pub mod navcode;
 pub mod scar;
 pub mod space;
 pub mod world;
 
 pub use location::Location;
-pub use world::{Ship, World};
+pub use world::{Ship, System, World};
 
 /// `t_realTimeSyncPoint`'s default, 2020-01-01T00:00:00Z.
 pub const EPOCH_UNIX_MS: i64 = 1_577_836_800_000;

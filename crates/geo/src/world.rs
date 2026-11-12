@@ -1,5 +1,5 @@
-//! What the game files say about the world navigation runs in: bodies and
-//! ships' braking. Filled by `sc-nav-data` from the install; plain data here,
+//! What the game files say about the world navigation runs in: bodies,
+//! systems and ships' braking. Filled by `sc-nav-data` from the install; plain data here,
 //! so the pure layers don't need the game files.
 
 use std::collections::BTreeMap;
@@ -22,6 +22,22 @@ pub struct Ship {
     pub max_speed: f32,
 }
 
+/// A star system: its id (as in the object containers, `stanton`) and
+/// where the star map puts it in the galaxy (star-map units; only good for
+/// telling systems apart, not for distances).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct System {
+    pub id: String,
+    pub galactic: Option<[f64; 3]>,
+}
+
+impl System {
+    /// The three-letter tag nav codes carry: `STA`, `PYR`, `NYX`.
+    pub fn tag(&self) -> String {
+        self.id.chars().take(3).collect::<String>().to_ascii_uppercase()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct World {
     /// The game build this was read from, e.g. `LIVE 4.10.2`.
@@ -29,6 +45,8 @@ pub struct World {
     pub bodies: Vec<Body>,
     /// By entity class name (telemetry's `class_name`).
     pub ships: BTreeMap<String, Ship>,
+    #[serde(default)]
+    pub systems: Vec<System>,
 }
 
 impl World {

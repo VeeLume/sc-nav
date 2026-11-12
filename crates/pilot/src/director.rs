@@ -579,6 +579,7 @@ mod tests {
             build: "test".into(),
             bodies: vec![lyria()],
             ships: BTreeMap::new(),
+            systems: vec![],
         };
         Director::new(data, None)
     }
