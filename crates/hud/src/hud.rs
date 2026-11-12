@@ -6,7 +6,7 @@
 //!
 //! - a chevron under the game's compass at the target's bearing (sideways
 //!   at the tape's end, with the turn, when it's beyond); below it the
-//!   target's name, distance and ETA, and the braking cue when it matters;
+//!   target's name, distance, ETA, and the braking cue when it matters;
 //! - in space, the target where it is on screen (a chevron at the edge
 //!   when it isn't), from the overlay's view direction and the game's FOV;
 //! - PULL UP below the crosshair.
@@ -19,7 +19,6 @@ use std::sync::Arc;
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, CornerRadius, FontId, Galley, Painter, Pos2, Rect, Shape, Stroke, Vec2, vec2};
-use eframe::epaint::Shadow;
 use sc_nav_geo::Cue;
 use sc_nav_geo::ground::{GroundLevel, GroundWarning};
 use sc_nav_geo::space::SpaceGuidance;
@@ -118,13 +117,6 @@ impl Hud {
         self.put(Pos2::new(cx - g.size().x / 2.0, top), g);
     }
 
-    /// A feathered darkening behind a block: no edge, just less glare.
-    fn scrim(&self, rect: Rect) {
-        let blur = (60.0 * self.u).min(255.0) as u8;
-        let shadow = Shadow { offset: [0, 0], blur, spread: 0, color: Color32::from_black_alpha(28) };
-        self.p.add(shadow.as_shape(rect, CornerRadius::same((10.0 * self.u) as u8)));
-    }
-
     /// A line with a soft glow of its own colour.
     fn glow(&self, pts: &[Pos2], width: f32, color: Color32, closed: bool) {
         let make = |w: f32, c: Color32| {
@@ -134,6 +126,12 @@ impl Hud {
         self.p.add(make(width + 7.0 * self.u, color.gamma_multiply(0.06)));
         self.p.add(make(width + 3.5 * self.u, color.gamma_multiply(0.16)));
         self.p.add(make(width, color));
+    }
+
+    /// A hairline from `y0` to `y1` at `x`.
+    fn divider(&self, x: f32, y0: f32, y1: f32) {
+        let x = self.snap(x) + 0.5 / self.ppp;
+        self.p.line_segment([Pos2::new(x, y0), Pos2::new(x, y1)], Stroke::new(1.0 / self.ppp, Color32::from_white_alpha(70)));
     }
 
     fn ring(&self, c: Pos2, radius: f32, width: f32, color: Color32) {
@@ -229,8 +227,8 @@ fn target(hud: &Hud, s: &Snapshot, c: &Compass, fov_deg: f32) {
             status(hud, cx, top, name, "no position");
             return;
         };
-        let bottom = info(hud, cx, top, name, g.distance_m, g.eta_s, g.age_s > 5.0);
-        cue(hud, cx, bottom + 10.0 * hud.u, g.cue, g.time_to_brake_s);
+        let brake = brake(hud, g.cue, g.time_to_brake_s);
+        info(hud, cx, top, name, g.distance_m, g.eta_s, brake, g.age_s > 5.0);
         on_screen(hud, g, name, fov_deg);
         return;
     }
@@ -248,14 +246,18 @@ fn target(hud: &Hud, s: &Snapshot, c: &Compass, fov_deg: f32) {
         return;
     };
     marker(hud, c, g.relative as f32, if g.stale { MUTED } else { MARK });
-    let bottom = info(hud, cx, top, name, g.distance_m, g.eta_s, g.stale);
-    cue(hud, cx, bottom + 10.0 * hud.u, g.cue, g.time_to_brake_s);
+    let brake = brake(hud, g.cue, g.time_to_brake_s);
+    info(hud, cx, top, name, g.distance_m, g.eta_s, brake, g.stale);
 }
 
-/// The target's name behind an accent bar, then two readouts either side of
-/// a hairline: distance (right aligned to it) and ETA (left aligned).
-/// Returns the block's bottom.
-fn info(hud: &Hud, cx: f32, top: f32, name: &str, distance_m: f64, eta_s: Option<f64>, stale: bool) -> f32 {
+/// A readout's value, its colour and its label.
+type Readout = (String, Color32, &'static str);
+
+/// The target's name behind an accent bar, then readouts either side of a
+/// hairline at the centre: distance to the left, ETA and the braking cue to
+/// the right. Returns the block's bottom.
+#[allow(clippy::too_many_arguments)]
+fn info(hud: &Hud, cx: f32, top: f32, name: &str, distance_m: f64, eta_s: Option<f64>, brake: Option<Readout>, stale: bool) -> f32 {
     let u = hud.u;
     let ink = if stale { MUTED } else { TEXT };
     let title = hud.label(name, 12.0, ink);
@@ -267,23 +269,42 @@ fn info(hud: &Hud, cx: f32, top: f32, name: &str, distance_m: f64, eta_s: Option
     hud.put(Pos2::new(tx + bar_w + 7.0 * u, top), &title);
 
     let y = top + title.size().y + 6.0 * u;
-    let (value, unit) = split_distance(distance_m);
     let gap = 14.0 * u;
+    let (value, unit) = split_distance(distance_m);
     let left = [hud.text(&value, 26.0, ink, 0.0), hud.label(unit, 9.5, MUTED)];
-    hud.put(Pos2::new(cx - gap - left[0].size().x, y), &left[0]);
     let label_y = y + left[0].size().y - 2.0 * u;
+    let bottom = label_y + left[1].size().y;
+    hud.put(Pos2::new(cx - gap - left[0].size().x, y), &left[0]);
     hud.put(Pos2::new(cx - gap - left[1].size().x, label_y), &left[1]);
-    let mut bottom = label_y + left[1].size().y;
+
+    let mut right: Vec<Readout> = vec![];
     if let Some(t) = eta_s {
-        let right = [hud.text(&clock(t), 26.0, ink, 0.0), hud.label("eta", 9.5, MUTED)];
-        hud.put(Pos2::new(cx + gap, y), &right[0]);
-        hud.put(Pos2::new(cx + gap, label_y), &right[1]);
-        let x = hud.snap(cx) + 0.5 / hud.ppp;
-        hud.p.line_segment([Pos2::new(x, y + 4.0 * u), Pos2::new(x, bottom - 2.0 * u)], Stroke::new(1.0 / hud.ppp, Color32::from_white_alpha(70)));
+        right.push((clock(t), ink, "eta"));
     }
-    bottom = bottom.max(label_y);
-    hud.scrim(Rect::from_min_max(Pos2::new(cx - 110.0 * u, top), Pos2::new(cx + 110.0 * u, bottom)));
+    right.extend(brake);
+    let mut x = cx;
+    for (value, color, label) in right {
+        hud.divider(x, y + 4.0 * u, bottom - 2.0 * u);
+        let v = hud.text(&value, 26.0, color, 0.0);
+        let l = hud.label(label, 9.5, if color == ink { MUTED } else { color });
+        hud.put(Pos2::new(x + gap, y), &v);
+        hud.put(Pos2::new(x + gap, label_y), &l);
+        // a fixed slot, so the next column doesn't move as digits change
+        let slot = hud.text("88:88", 26.0, TEXT, 0.0).size().x.max(v.size().x).max(l.size().x);
+        x += gap + slot + gap;
+    }
     bottom
+}
+
+/// The braking cue as a readout, only while it matters.
+fn brake(hud: &Hud, cue: Cue, time_to_brake_s: Option<f64>) -> Option<Readout> {
+    match (cue, time_to_brake_s) {
+        (Cue::Cruise, Some(t)) if t < 90.0 => Some((clock(t), MUTED, "brake")),
+        (Cue::Prepare, t) => Some((clock(t.unwrap_or(0.0)), AMBER, "brake")),
+        (Cue::Brake, _) => Some(("NOW".into(), RED.gamma_multiply(0.6 + 0.4 * hud.pulse()), "brake")),
+        (Cue::Arrived, _) => Some(("HERE".into(), MARK, "arrived")),
+        _ => None,
+    }
 }
 
 fn status(hud: &Hud, cx: f32, top: f32, name: &str, why: &str) {
@@ -311,26 +332,6 @@ fn marker(hud: &Hud, c: &Compass, rel: f32, color: Color32) {
     let g = hud.text(&format!("{:.0}°", rel.abs()), 18.0, color, 0.0);
     let x = if side > 0.0 { tip.x + 8.0 * hud.u } else { tip.x - 8.0 * hud.u - g.size().x };
     hud.put(Pos2::new(x, ty - g.size().y / 2.0), &g);
-}
-
-/// The braking cue, only while it matters.
-fn cue(hud: &Hud, cx: f32, top: f32, cue: Cue, time_to_brake_s: Option<f64>) {
-    let timed = |label_color: Color32, bar: Color32, t: f64| {
-        let segs = [Hud::seg(hud.label("brake in", 11.0, label_color)), hud.num(hud.text(&clock(t), 16.0, TEXT, 0.0), "8:88", 16.0)];
-        hud.card(cx, top, &segs, bar, glass());
-    };
-    match (cue, time_to_brake_s) {
-        (Cue::Cruise, Some(t)) if t < 90.0 => timed(MUTED, MUTED, t),
-        (Cue::Prepare, t) => timed(AMBER, AMBER, t.unwrap_or(0.0)),
-        (Cue::Brake, _) => {
-            let fill = Color32::from_rgba_unmultiplied(150, 30, 26, (150.0 + 80.0 * hud.pulse()) as u8);
-            hud.card(cx, top, &[Hud::seg(hud.label("brake now", 13.0, TEXT))], RED, fill);
-        }
-        (Cue::Arrived, _) => {
-            hud.card(cx, top, &[Hud::seg(hud.label("arrived", 12.0, TEXT))], MARK, glass());
-        }
-        _ => {}
-    }
 }
 
 /// A space target where it is on screen, from the view angles: a thin
@@ -410,8 +411,8 @@ fn preview(hud: &Hud, c: &Compass) {
         marker(hud, c, deg, MARK.gamma_multiply(0.5));
     }
     marker(hud, c, 0.0, MARK);
-    let bottom = info(hud, cx, ty + BLOCK_DY * hud.u, "preview", 1200.0, Some(42.0), false);
-    cue(hud, cx, bottom + 10.0 * hud.u, Cue::Cruise, Some(30.0));
+    let brake = brake(hud, Cue::Cruise, Some(30.0));
+    info(hud, cx, ty + BLOCK_DY * hud.u, "preview", 1200.0, Some(42.0), brake, false);
 }
 
 /// The number and its unit, apart: `("22.5", "km")`.
