@@ -86,13 +86,17 @@ pub struct Compass {
     pub per_deg: f32,
     /// Degrees the tape shows each side of the heading.
     pub span: f32,
+    /// Name, distance and ETA above the tape (room there in a seat), the
+    /// braking cue alone below it; otherwise everything below.
+    #[serde(default)]
+    pub above: bool,
 }
 
 impl Compass {
     /// Measured on a Constellation's HUD at 16:9.
-    pub const SHIP: Compass = Compass { y: 0.364, per_deg: 0.00249, span: 38.0 };
+    pub const SHIP: Compass = Compass { y: 0.364, per_deg: 0.00249, span: 38.0, above: true };
     /// Measured on the visor at 16:9.
-    pub const FOOT: Compass = Compass { y: 0.031, per_deg: 0.00373, span: 40.0 };
+    pub const FOOT: Compass = Compass { y: 0.031, per_deg: 0.00373, span: 40.0, above: false };
 }
 
 impl Default for Prefs {

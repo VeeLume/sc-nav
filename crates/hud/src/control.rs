@@ -451,6 +451,9 @@ impl Control {
                     ui.label(RichText::new("tape ends at").color(DIM));
                     changed |= ui.add(egui::Slider::new(&mut c.span, 10.0..=90.0).suffix("°")).changed();
                     ui.end_row();
+                    ui.label(RichText::new("readouts").color(DIM));
+                    changed |= ui.checkbox(&mut c.above, "above the compass").changed();
+                    ui.end_row();
                 });
             }
             ui.add_space(4.0);
