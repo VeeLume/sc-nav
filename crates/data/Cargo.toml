@@ -1,0 +1,19 @@
+[package]
+name = "sc-nav-data"
+description = "sc-nav's game data read from the Star Citizen install at runtime through sc-holotable: bodies, ships' braking (cached per build), the overlay font"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sc-nav-geo = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+sc-holotable = { git = "https://github.com/VeeLume/sc-holotable.git", tag = "sc-holotable/v0.47.0", default-features = false, features = [
+    "installs",
+    "items",
+    "vehicles",
+    "ship-components",
+] }

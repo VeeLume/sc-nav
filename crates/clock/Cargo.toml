@@ -1,0 +1,10 @@
+[package]
+name = "sc-nav-clock"
+description = "A corrected wall clock: SNTP against public time servers (std only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

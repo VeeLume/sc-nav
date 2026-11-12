@@ -1,0 +1,28 @@
+[package]
+name = "sc-nav-pilot"
+description = "The convenient layer for sc-nav: game telemetry + the r_DisplayInfo overlay + /showlocation fused into one navigation state (marks, steering, braking, PULL UP); runtime feeds, recording and replay behind features"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Live feeds (telemetry stream, clipboard, screen), recording and replay.
+runtime = ["dep:sc-nav-capture", "dep:sc-nav-overlay", "dep:sc-nav-clock", "dep:image"]
+
+[dependencies]
+sc-nav-geo = { workspace = true }
+sc-dossier = { git = "https://github.com/VeeLume/sc-dossier", tag = "v0.14.0", default-features = false, features = ["telemetry"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+sc-nav-capture = { workspace = true, optional = true }
+sc-nav-overlay = { workspace = true, optional = true }
+sc-nav-clock = { workspace = true, optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+
+[[test]]
+name = "recorded"
+required-features = ["runtime"]

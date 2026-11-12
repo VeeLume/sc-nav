@@ -1,0 +1,15 @@
+[package]
+name = "sc-nav-overlay"
+description = "Read Star Citizen's r_DisplayInfo overlay from pixels: positions (CamPos, Zone, Root) under a checksum, the view (CamDir), the location name; no capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sc-nav-glyph = { workspace = true }
+sc-nav-geo = { workspace = true }
+fontdue = "0.9"
+image = { version = "0.25", default-features = false }
+serde = { workspace = true }

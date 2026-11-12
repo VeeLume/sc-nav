@@ -1,0 +1,11 @@
+[package]
+name = "sc-nav-glyph"
+description = "Read a line of game text from an ink image against glyph templates passed in as data: placement by grammar, ranked candidates per position"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure on purpose: no capture, no IO, no platform code.
+[dependencies]

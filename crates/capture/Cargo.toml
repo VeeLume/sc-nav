@@ -1,0 +1,24 @@
+[package]
+name = "sc-nav-capture"
+description = "Windows capture for sc-nav: the overlay region of the screen (with recording) and /showlocation from the clipboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sc-nav-geo = { workspace = true }
+sc-nav-overlay = { workspace = true }
+sc-nav-clock = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+xcap = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
