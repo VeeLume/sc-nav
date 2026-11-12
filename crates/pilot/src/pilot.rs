@@ -143,11 +143,13 @@ pub struct Snapshot {
     pub target: Option<String>,
     /// The target is a point in space.
     pub target_space: bool,
-    /// The target's body when it isn't the one below.
+    /// The target's body (display name) when it isn't the one below.
     pub target_elsewhere: Option<String>,
     /// The position is provisional (a `/showlocation` on an uncalibrated body).
     pub provisional: bool,
     pub guidance: Option<Guidance>,
+    /// Direction of travel over the ground, degrees (from fixes and turns).
+    pub track: Option<f64>,
     pub space: Option<SpaceGuidance>,
     pub ground: Option<GroundWarning>,
     /// Unix ms and source of the last fix.
@@ -436,9 +438,12 @@ impl Pilot {
             view: self.dir.space.view.is_some(),
             target: self.dir.target_name().map(str::to_string),
             target_space: self.dir.space_targeted(),
-            target_elsewhere: self.dir.target_elsewhere().map(str::to_string),
+            target_elsewhere: self.dir.target_elsewhere().map(|id| {
+                self.dir.data.body(id).map_or(id.to_string(), |b| pretty(&b.name))
+            }),
             provisional: self.dir.provisional(),
             guidance: self.guidance,
+            track: self.dir.nav.track(),
             space: self.space,
             ground: self.ground_w,
             last_fix: self.last_fix,

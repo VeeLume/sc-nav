@@ -26,6 +26,18 @@ game's own local telemetry stream (when started with
 Pick what you need: a Stream Deck plugin takes `sc-nav-pilot`, something that
 only wants SCAR takes `sc-nav-geo`.
 
+## Run
+
+```bash
+cargo run --release -p sc-nav-hud            # the game started with GRPC_CLIENT_SERVER_ENABLED=true
+cargo run --release -p sc-nav-hud -- --demo  # a simulated flight, no game
+```
+
+The first start after a patch reads the game files (about two minutes).
+Everything the app keeps (that cache, marks, measured phases, recorded
+sessions) lives in `%LOCALAPPDATA%\sc-nav`; `SC_NAV_HOME` moves it. Play in
+borderless windowed mode: exclusive fullscreen hides the HUD.
+
 ## Ethics
 
 Read-only and local. The telemetry is the game's own opt-in local service; the

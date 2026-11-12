@@ -1,0 +1,27 @@
+[package]
+name = "sc-nav-hud"
+description = "sc-nav's desktop app: a click-through navigation HUD over Star Citizen and a control window (marks, targets, recording, replay)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sc-nav"
+path = "src/main.rs"
+
+[dependencies]
+sc-nav-geo = { workspace = true }
+sc-nav-data = { workspace = true }
+sc-nav-clock = { workspace = true }
+sc-nav-pilot = { workspace = true, features = ["runtime"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+# glow, not wgpu: wgpu's dx12 backend clashes with the windows crate xcap pulls in
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+raw-window-handle = "0.6"
+xcap = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }

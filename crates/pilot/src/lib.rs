@@ -16,5 +16,8 @@ pub mod pilot;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 
+/// The telemetry types the pilot takes (sc-dossier's `telemetry` feature).
+pub use sc_dossier::telemetry;
+
 pub use director::{Director, Here, load_phases};
 pub use pilot::{Cmd, Input, Link, Message, OverlayFix, Pilot, Snapshot, pretty};
