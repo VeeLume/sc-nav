@@ -58,12 +58,47 @@ pub fn read_marks(path: &Path) -> Result<BTreeMap<String, Location>, String> {
 
 /// What the user sets in the app. Unknown or missing fields fall back to
 /// the defaults, so old files keep loading.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Prefs {
-    /// The HUD also shows what the game already shows and what only helps
-    /// finding a fault.
+    /// The debug panel beside the HUD: what the game already shows and
+    /// what only helps finding a fault.
     pub debug: bool,
+    /// The game's compass in a seat (the ship's HUD).
+    pub ship: Compass,
+    /// The game's compass on foot (the visor).
+    pub foot: Compass,
+    /// The game's vertical field of view (`FOV` on `r_DisplayInfo 2`'s
+    /// `CamDir` line), for placing space targets on screen.
+    pub fov_deg: f32,
+    /// Draw a sample marker and rows while adjusting the layout.
+    #[serde(skip)]
+    pub preview: bool,
+}
+
+/// Where the game draws a compass: its tape's height and scale, as
+/// fractions of the screen height, so they hold at any resolution.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Compass {
+    /// The tape's line, from the top.
+    pub y: f32,
+    /// One degree of heading along the tape.
+    pub per_deg: f32,
+    /// Degrees the tape shows each side of the heading.
+    pub span: f32,
+}
+
+impl Compass {
+    /// Measured on a Constellation's HUD at 16:9.
+    pub const SHIP: Compass = Compass { y: 0.364, per_deg: 0.00249, span: 38.0 };
+    /// Measured on the visor at 16:9.
+    pub const FOOT: Compass = Compass { y: 0.031, per_deg: 0.00373, span: 40.0 };
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self { debug: false, ship: Compass::SHIP, foot: Compass::FOOT, fov_deg: 63.0, preview: false }
+    }
 }
 
 impl Prefs {

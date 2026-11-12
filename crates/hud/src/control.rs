@@ -416,14 +416,52 @@ impl Control {
 
     fn settings(&mut self, ui: &mut egui::Ui, rt: &Runtime, store: &Store, prefs: &mut Prefs) {
         card(ui, "HUD", |ui| {
-            if ui.checkbox(&mut prefs.debug, "Debug details").changed() {
-                prefs.save(&store.prefs());
-            }
+            let mut changed = ui.checkbox(&mut prefs.debug, "Debug panel").changed();
             ui.label(
-                RichText::new("Adds the game's own instruments, the telemetry link, where the position came from and the raw bearing. Off, the HUD shows only while there is a target or a ground warning.")
+                RichText::new("Everything the navigation knows, in a panel at the right: the game's instruments, the telemetry link, where the position came from, raw figures.")
                     .color(DIM)
                     .size(12.0),
             );
+            ui.add_space(4.0);
+            ui.checkbox(&mut prefs.preview, "Show the layout preview");
+            ui.label(
+                RichText::new("Draws a sample marker straight ahead and at 20° each side, and orange ticks where the game's compass tape should end. Line them up with the game's compass, in a seat and on foot.")
+                    .color(DIM)
+                    .size(12.0),
+            );
+            for (title, c, default) in [
+                ("In a seat", &mut prefs.ship, crate::store::Compass::SHIP),
+                ("On foot", &mut prefs.foot, crate::store::Compass::FOOT),
+            ] {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title).strong());
+                    if ui.small_button("Reset").clicked() {
+                        *c = default;
+                        changed = true;
+                    }
+                });
+                egui::Grid::new(title).num_columns(2).show(ui, |ui| {
+                    ui.label(RichText::new("height").color(DIM));
+                    changed |= ui.add(egui::Slider::new(&mut c.y, 0.0..=0.9).fixed_decimals(3)).changed();
+                    ui.end_row();
+                    ui.label(RichText::new("scale").color(DIM));
+                    changed |= ui.add(egui::Slider::new(&mut c.per_deg, 0.001..=0.008).fixed_decimals(5)).changed();
+                    ui.end_row();
+                    ui.label(RichText::new("tape ends at").color(DIM));
+                    changed |= ui.add(egui::Slider::new(&mut c.span, 10.0..=90.0).suffix("°")).changed();
+                    ui.end_row();
+                });
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Game FOV (vertical)").color(DIM));
+                changed |= ui.add(egui::Slider::new(&mut prefs.fov_deg, 30.0..=110.0).suffix("°")).changed();
+            });
+            ui.label(RichText::new("For space targets on screen: the FOV value on r_DisplayInfo 2's CamDir line.").color(DIM).size(12.0));
+            if changed {
+                prefs.save(&store.prefs());
+            }
         });
         ui.add_space(6.0);
         card(ui, "Inputs", |ui| {

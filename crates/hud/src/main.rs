@@ -18,6 +18,7 @@
 mod control;
 mod demo;
 mod hud;
+mod panel;
 mod store;
 mod theme;
 
@@ -32,9 +33,6 @@ use sc_nav_pilot::{Director, Pilot, load_phases, telemetry};
 
 use store::{Prefs, Store};
 use theme::{ACCENT, ALERT, DIM, INK};
-
-/// HUD position: fraction of the screen height from the top.
-const HUD_Y: f32 = 0.66;
 
 enum Phase {
     Loading { rx: Receiver<Result<(World, Vec<u8>)>>, since: Instant },
@@ -56,12 +54,15 @@ fn main() -> Result<()> {
     let demo = std::env::args().any(|a| a == "--demo");
     let store = Store::locate();
 
-    let (hud_pos, control_pos) = placement().unwrap_or(([200.0, 600.0], [40.0, 160.0]));
+    let (screen, control_pos) = placement().unwrap_or(([0.0, 0.0, 1920.0, 1080.0], [40.0, 160.0]));
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("sc-nav HUD")
-            .with_inner_size([hud::W, hud::H])
-            .with_position(hud_pos)
+            // one pixel short of the monitor: a borderless window that covers it
+            // exactly counts as fullscreen, and the driver then skips the
+            // desktop compositor, which turns the transparency black
+            .with_inner_size([screen[2], screen[3] - 1.0])
+            .with_position([screen[0], screen[1]])
             .with_decorations(false)
             .with_transparent(true)
             .with_has_shadow(false)
@@ -96,16 +97,16 @@ fn main() -> Result<()> {
     .map_err(|e| anyhow!("{e}"))
 }
 
-/// Where the HUD (centred, below the crosshair) and the control window go on
-/// the primary monitor, in points.
-fn placement() -> Option<([f32; 2], [f32; 2])> {
+/// The primary monitor (`[x, y, w, h]`, which the HUD covers) and where the
+/// control window goes, in points.
+fn placement() -> Option<([f32; 4], [f32; 2])> {
     let monitors = xcap::Monitor::all().ok()?;
     let m = monitors.iter().find(|m| m.is_primary().unwrap_or(false)).or(monitors.first())?;
     // xcap reports physical pixels; egui positions in points
     let scale = m.scale_factor().unwrap_or(1.0);
     let (x, y) = (m.x().ok()? as f32 / scale, m.y().ok()? as f32 / scale);
     let (w, h) = (m.width().ok()? as f32 / scale, m.height().ok()? as f32 / scale);
-    Some(([x + (w - hud::W) / 2.0, y + h * HUD_Y], [x + 40.0, y + h * 0.15]))
+    Some(([x, y, w, h], [x + 40.0, y + h * 0.15]))
 }
 
 impl App {
@@ -217,7 +218,7 @@ impl eframe::App for App {
                 p.tick(now);
                 p.snapshot()
             };
-            hud::draw(ui, &snap, self.prefs.debug);
+            hud::draw(ui, &snap, &self.prefs);
         }
         self.control_window(&ctx);
     }

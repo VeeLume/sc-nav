@@ -19,7 +19,31 @@ pub fn glass() -> Color32 {
     Color32::from_rgba_unmultiplied(10, 14, 20, 170)
 }
 
+/// The HUD's font family: a heavier face that holds up over the game.
+pub fn hud_font() -> egui::FontFamily {
+    egui::FontFamily::Name("hud".into())
+}
+
+/// Windows' own UI faces when present (neutral, nothing to ship); egui's
+/// defaults otherwise.
+fn fonts(ctx: &egui::Context) {
+    let read = |name: &str| std::fs::read(format!(r"C:\Windows\Fonts\{name}")).ok();
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(ui) = read("segoeui.ttf") {
+        fonts.font_data.insert("ui".into(), egui::FontData::from_owned(ui).into());
+        fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "ui".into());
+    }
+    let mut hud = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
+    if let Some(bold) = read("seguisb.ttf") {
+        fonts.font_data.insert("hud".into(), egui::FontData::from_owned(bold).into());
+        hud.insert(0, "hud".into());
+    }
+    fonts.families.insert(hud_font(), hud);
+    ctx.set_fonts(fonts);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    fonts(ctx);
     let mut v = Visuals::dark();
     v.panel_fill = PANEL;
     v.window_fill = PANEL;
