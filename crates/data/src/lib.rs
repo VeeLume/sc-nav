@@ -3,12 +3,11 @@
 //! ones.
 //!
 //! - [`bodies`]: every planet and moon with centre, radius, day length and
-//!   atmosphere (`<system>system.socpak` nests `<Child>` nodes with a `pos`
-//!   relative to their parent; each body's socpak has `planetRadius` /
-//!   `planetRotationSpeed` / `planetAxis`, its `.ale` the `AtmoHeight`).
-//!   A few socpak reads: done at every start.
-//! - [`ships`]: braking and speeds per ship from the full DataCore parse:
-//!   seconds of work, so cached per game build under the caller's directory.
+//!   atmosphere, from holotable's `Bodies`.
+//! - ships: braking and speeds per ship.
+//!
+//! Both come from the full DataCore parse ([`records`]): seconds of work, so
+//! cached per game build under the caller's directory.
 //! - [`overlay_font`]: `Engine/Fonts/VeraMono.ttf`, the `r_DisplayInfo` font.
 //!
 //! [`load`] does all three.
@@ -17,16 +16,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use sc_holotable::asset::object_container::{Socpak, XmlNode, decode};
-use sc_holotable::asset::{AssetConfig, AssetData, AssetSource, Datacore, Guid, RecordCollection};
+use sc_holotable::asset::{
+    AssetConfig, AssetData, AssetSource, Datacore, Guid, LocaleMap, RecordCollection,
+};
 use sc_holotable::install::{Installation, discover_primary};
 use sc_holotable::items::Items;
+use sc_holotable::locations::{Bodies, Locations};
 use sc_holotable::ship_components::ShipComponents;
 use sc_holotable::vehicles::{Flight, PortContainers, Vehicles, port_axes};
 use sc_nav_geo::{Body, Ship, System, World};
 
-/// Bumped when [`World`] gains what an older cache lacks.
-const CACHE: u32 = 2;
+/// Bumped when [`World`] gains what an older cache lacks, or its values
+/// change (3: bodies from holotable, microTech's moons placed right).
+const CACHE: u32 = 3;
 
 /// The world and the overlay font from the primary install. Everything is
 /// cached in `cache_dir` per exact build (`world-<channel>-<version>.json` and
@@ -48,9 +50,8 @@ pub fn load(cache_dir: &Path) -> Result<(World, Vec<u8>)> {
         return Ok((world, font));
     }
     let assets = AssetSource::from_install(&install).context("opening Data.p4k")?;
-    let bodies = bodies(&assets)?;
     let font = overlay_font(&assets)?;
-    let (ships, systems) = records(&install)?;
+    let Records { bodies, ships, systems } = records(&install)?;
     let world = World {
         build: build_of(&install),
         bodies,
@@ -93,10 +94,17 @@ pub fn overlay_font(assets: &AssetSource) -> Result<Vec<u8>> {
     Ok(assets.read_entry(&entry)?)
 }
 
-/// Every ship's flight figures with its stock loadout. Runs on its own
-/// thread with a large stack: the DataCore walk overflows Windows' 1 MB main
-/// stack.
-pub fn records(install: &Installation) -> Result<(BTreeMap<String, Ship>, Vec<System>)> {
+/// What the DataCore parse yields.
+pub struct Records {
+    pub bodies: Vec<Body>,
+    pub ships: BTreeMap<String, Ship>,
+    pub systems: Vec<System>,
+}
+
+/// Bodies, every ship's flight figures with its stock loadout, and the
+/// systems. Runs on its own thread with a large stack: the DataCore walk
+/// overflows Windows' 1 MB main stack.
+pub fn records(install: &Installation) -> Result<Records> {
     let install = install.clone();
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -105,10 +113,15 @@ pub fn records(install: &Installation) -> Result<(BTreeMap<String, Ship>, Vec<Sy
         .map_err(|_| anyhow::anyhow!("DataCore extraction panicked"))?
 }
 
-fn records_inner(assets: &AssetSource) -> Result<(BTreeMap<String, Ship>, Vec<System>)> {
+fn records_inner(assets: &AssetSource) -> Result<Records> {
     let data = AssetData::extract(assets, &AssetConfig::standard())?;
     let datacore = Datacore::parse(assets, &data)?;
-    Ok((ships(assets, &datacore)?, systems(&datacore)))
+    let locations = Locations::build(datacore.records());
+    Ok(Records {
+        bodies: bodies(assets, &locations, &data.locale)?,
+        ships: ships(assets, &datacore)?,
+        systems: systems(&datacore),
+    })
 }
 
 /// The star systems and their galactic positions (`SSolarSystem`). The id is
@@ -168,137 +181,28 @@ fn ships(assets: &AssetSource, datacore: &Datacore) -> Result<BTreeMap<String, S
     Ok(ships)
 }
 
-/// Every planet and moon (rotating about +Z; others are skipped).
-pub fn bodies(assets: &AssetSource) -> Result<Vec<Body>> {
-    let systems: Vec<String> = assets
-        .find(|n| {
-            let l = n.to_ascii_lowercase().replace('\\', "/");
-            l.contains("/pu/system/") && l.ends_with("system.socpak")
+/// Every planet and moon from holotable's [`Bodies`], keyed by the
+/// container's short id (`stanton1a`: nav codes and marks carry it). Bodies
+/// spinning about another axis than +Z are skipped (the frames assume +Z).
+/// Fuego's period is 0: it does not turn, see [`Body::spin`].
+pub fn bodies(assets: &AssetSource, locations: &Locations, locale: &LocaleMap) -> Result<Vec<Body>> {
+    let mut out: Vec<Body> = Bodies::build(assets, locations)?
+        .values()
+        .filter(|b| b.axis == [0.0, 0.0, 1.0])
+        .map(|b| Body {
+            id: b.short_id().to_string(),
+            name: locations
+                .get(&b.guid)
+                .and_then(|l| l.display_name(locale))
+                .unwrap_or(b.short_id())
+                .to_string(),
+            center: b.position,
+            radius_m: b.radius,
+            period_h: b.rotation_period_h,
+            atmo_km: b.atmosphere_height.map(|m| m / 1000.0),
+            phase_deg: None,
         })
-        .map(|e| e.name.to_string())
         .collect();
-
-    let mut placed = Vec::new();
-    for sp in &systems {
-        let mut pak = Socpak::open(assets.read(sp)?)?;
-        for m in 0..pak.len() {
-            let member = pak.name(m).unwrap_or_default().to_ascii_lowercase();
-            if !member.ends_with("system.xml") {
-                continue;
-            }
-            let Ok(Some(root)) = decode(&pak.read(m)?) else {
-                continue;
-            };
-            walk(&root, [0.0; 3], &mut placed);
-        }
-    }
-
-    let mut out = Vec::new();
-    for (path, name, center) in placed {
-        match body_params(assets, &path) {
-            Ok(Some((id, radius_m, period_h, axis, atmo_km))) => {
-                if axis != [0.0, 0.0, 1.0] {
-                    continue;
-                }
-                out.push(Body {
-                    id,
-                    name,
-                    center,
-                    radius_m,
-                    period_h,
-                    atmo_km,
-                    phase_deg: None,
-                });
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        }
-    }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
-}
-
-/// Collect every `<Child>` pointing at a socpak directly under `pu/system/<sys>/`,
-/// with its position summed down the nesting.
-fn walk(node: &XmlNode, base: [f64; 3], out: &mut Vec<(String, String, [f64; 3])>) {
-    for child in &node.children {
-        let mut here = base;
-        if child.tag == "Child" {
-            if let Some(p) = child.attr("pos").and_then(vec3) {
-                here = [base[0] + p[0], base[1] + p[1], base[2] + p[2]];
-            }
-            if let Some(name) = child.attr("name") {
-                let l = name.to_ascii_lowercase();
-                let direct = l
-                    .strip_prefix("data/objectcontainers/pu/system/")
-                    .is_some_and(|r| r.matches('/').count() == 1);
-                if direct && l.ends_with(".socpak") {
-                    let label = child.attr("entityName").unwrap_or(name).to_string();
-                    out.push((name.to_string(), label, here));
-                }
-            }
-        }
-        walk(child, here, out);
-    }
-}
-
-type Params = (String, f64, f64, [f64; 3], Option<f64>);
-
-fn body_params(assets: &AssetSource, path: &str) -> Result<Option<Params>> {
-    let want = path.to_ascii_lowercase().replace('\\', "/");
-    let entry = assets
-        .find(|n| n.to_ascii_lowercase().replace('\\', "/") == want)
-        .map(|e| e.name.to_string())
-        .next();
-    let Some(entry) = entry else { return Ok(None) };
-    let id = want
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches(".socpak")
-        .to_string();
-
-    let mut pak = Socpak::open(assets.read(&entry)?)?;
-    let (mut params, mut atmo) = (None, None);
-    for m in 0..pak.len() {
-        let member = pak
-            .name(m)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .replace('\\', "/");
-        let file = member.rsplit('/').next().unwrap_or("");
-        if file == format!("{id}.xml") {
-            let Ok(Some(root)) = decode(&pak.read(m)?) else {
-                continue;
-            };
-            params = root.descendants().find_map(|n| {
-                let period: f64 = n.attr("planetRotationSpeed")?.parse().ok()?;
-                let radius: f64 = n.attr("planetRadius")?.parse().ok()?;
-                let axis = n.attr("planetAxis").and_then(vec3)?;
-                Some((radius, period, axis))
-            });
-        } else if file == format!("{id}.ale") {
-            atmo = atmo_height(&pak.read(m)?);
-        }
-    }
-    Ok(params
-        .filter(|(_, period, _)| *period > 0.0)
-        .map(|(radius, period, axis)| (id, radius, period, axis, atmo)))
-}
-
-/// `AtmoHeight` from the JSON embedded in a `.ale` chunk file.
-fn atmo_height(bytes: &[u8]) -> Option<f64> {
-    let key = b"\"AtmoHeight\"";
-    let at = bytes.windows(key.len()).position(|w| w == key)? + key.len();
-    let rest = bytes.get(at..at + 40)?;
-    let text = String::from_utf8_lossy(rest);
-    let value = text.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
-    let end = value.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))?;
-    value[..end].parse().ok()
-}
-
-fn vec3(s: &str) -> Option<[f64; 3]> {
-    let mut it = s.split(',').map(|v| v.trim().parse::<f64>());
-    let v = [it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?];
-    it.next().is_none().then_some(v)
 }

@@ -50,11 +50,14 @@ fn run(depth: usize) -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let containers = ObjectContainers::systems(&assets, depth)?;
     eprintln!("systems({depth}): {} placements in {:?}", containers.len(), t.elapsed());
-    let universe = Universe::join(Locations::build(datacore.records()), containers);
+    let locations = Locations::build(datacore.records());
+    // the bodies sc-nav-data reads
+    let bodies: std::collections::HashSet<String> = sc_nav_data::bodies(&assets, &locations, &data.locale)?
+        .into_iter()
+        .map(|b| b.id)
+        .collect();
+    let universe = Universe::join(locations, containers);
     let containers = universe.containers();
-    // the rotating bodies: what sc-nav-data reads as bodies
-    let bodies: std::collections::HashSet<String> =
-        sc_nav_data::bodies(&assets)?.into_iter().map(|b| b.id).collect();
 
     let mut rows = vec![];
     for (guid, location) in universe.star_map().iter() {

@@ -103,8 +103,12 @@ impl Body {
         Some(self.to_global([v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2]], unix_ms))
     }
 
-    /// Spin angle in radians at `unix_ms`.
+    /// Spin angle in radians at `unix_ms`. 0 for a body that does not turn
+    /// (`period_h` 0, Fuego).
     pub fn spin(&self, unix_ms: i64) -> f64 {
+        if self.period_h <= 0.0 {
+            return 0.0;
+        }
         let cycles = (unix_ms - EPOCH_UNIX_MS) as f64 / 3_600_000.0 / self.period_h;
         cycles.rem_euclid(1.0) * std::f64::consts::TAU
     }
@@ -132,6 +136,9 @@ impl Body {
 
     /// Eastward surface speed of the ground at the equator, m/s.
     pub fn equator_speed(&self) -> f64 {
+        if self.period_h <= 0.0 {
+            return 0.0;
+        }
         std::f64::consts::TAU * self.radius_m / (self.period_h * 3600.0)
     }
 }
