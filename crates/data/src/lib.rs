@@ -27,8 +27,9 @@ use sc_holotable::vehicles::{Flight, PortContainers, Vehicles, port_axes};
 use sc_nav_geo::{Body, Ship, System, World};
 
 /// Bumped when [`World`] gains what an older cache lacks, or its values
-/// change (3: bodies from holotable, microTech's moons placed right).
-const CACHE: u32 = 3;
+/// change (3: bodies from holotable, microTech's moons placed right; 4:
+/// Pyro in its star's rotated frame).
+const CACHE: u32 = 4;
 
 /// The world and the overlay font from the primary install. Everything is
 /// cached in `cache_dir` per exact build (`world-<channel>-<version>.json` and
