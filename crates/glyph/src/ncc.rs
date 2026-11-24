@@ -1,0 +1,141 @@
+//! NCC without the per-pixel bookkeeping: templates centred and scaled to
+//! unit norm once, window sums of the image from summed-area tables, so a
+//! score is one dot product. Same scores as [`crate::ncc_at`] up to float
+//! rounding.
+
+use crate::Gray;
+
+/// Windows flatter than this score 0, as in [`crate::ncc_at`].
+const FLAT: f64 = 1e-6;
+
+/// `t` minus its mean, scaled to unit norm; `None` for a flat template.
+pub(crate) fn unit(t: &Gray) -> Option<Vec<f32>> {
+    let n = t.v.len() as f64;
+    let mean = t.v.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let var: f64 = t.v.iter().map(|&v| (v as f64 - mean).powi(2)).sum();
+    if var <= FLAT {
+        return None;
+    }
+    let k = var.sqrt();
+    Some(
+        t.v.iter()
+            .map(|&v| ((v as f64 - mean) / k) as f32)
+            .collect(),
+    )
+}
+
+/// Summed-area tables of an image and of its square, for window variances.
+pub(crate) struct Stats {
+    w1: usize,
+    s: Vec<f64>,
+    ss: Vec<f64>,
+}
+
+impl Stats {
+    pub(crate) fn new(img: &Gray) -> Self {
+        let w1 = img.w + 1;
+        let mut s = vec![0.0; w1 * (img.h + 1)];
+        let mut ss = vec![0.0; w1 * (img.h + 1)];
+        for y in 0..img.h {
+            let (mut r, mut rr) = (0.0, 0.0);
+            for x in 0..img.w {
+                let v = img.v[y * img.w + x] as f64;
+                r += v;
+                rr += v * v;
+                s[(y + 1) * w1 + x + 1] = s[y * w1 + x + 1] + r;
+                ss[(y + 1) * w1 + x + 1] = ss[y * w1 + x + 1] + rr;
+            }
+        }
+        Self { w1, s, ss }
+    }
+
+    /// Sum and sum of squares over the window at (x, y), `w` x `h`.
+    fn sums(&self, x: usize, y: usize, w: usize, h: usize) -> (f64, f64) {
+        let (a, b) = (y * self.w1 + x, (y + h) * self.w1 + x);
+        let box_ = |t: &[f64]| t[b + w] - t[b] - t[a + w] + t[a];
+        (box_(&self.s), box_(&self.ss))
+    }
+
+    /// Σ(v − mean)² over the window, or `None` when it is flat.
+    pub(crate) fn spread(&self, x: usize, y: usize, w: usize, h: usize) -> Option<f64> {
+        let (s, ss) = self.sums(x, y, w, h);
+        let var = ss - s * s / (w * h) as f64;
+        (var > FLAT).then_some(var)
+    }
+
+    /// The window's mean.
+    pub(crate) fn mean(&self, x: usize, y: usize, w: usize, h: usize) -> f64 {
+        self.sums(x, y, w, h).0 / (w * h) as f64
+    }
+}
+
+/// Dot product, eight lanes at a time.
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
+    for (x, y) in ca.iter().zip(cb) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let mut s: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+    for v in acc {
+        s += v;
+    }
+    s
+}
+
+/// Scores of the unit template `u` (`w` x `h`) at every top-left
+/// (x, y) of `img` with x in `0..nx`, for one row offset `y`: the
+/// numerators, accumulated across x so the loop vectorises. `out` is
+/// overwritten.
+pub(crate) fn row_dots(img: &Gray, u: &[f32], w: usize, h: usize, y: usize, out: &mut [f32]) {
+    let nx = out.len();
+    out.fill(0.0);
+    for ty in 0..h {
+        let row = &img.v[(y + ty) * img.w..(y + ty + 1) * img.w];
+        for tx in 0..w {
+            let c = u[ty * w + tx];
+            if c == 0.0 {
+                continue;
+            }
+            for (o, a) in out.iter_mut().zip(&row[tx..tx + nx]) {
+                *o += c * a;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ncc_at;
+
+    fn noise(w: usize, h: usize, seed: u32) -> Gray {
+        let mut g = Gray::new(w, h);
+        let mut s = seed;
+        for v in &mut g.v {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 8) as f32 / (1u32 << 24) as f32;
+        }
+        g
+    }
+
+    #[test]
+    fn matches_ncc_at() {
+        let img = noise(40, 13, 1);
+        let t = noise(7, 9, 2);
+        let u = unit(&t).unwrap();
+        let st = Stats::new(&img);
+        let nx = img.w - t.w + 1;
+        let mut out = vec![0.0; nx];
+        for y in 0..=img.h - t.h {
+            row_dots(&img, &u, t.w, t.h, y, &mut out);
+            for (x, &d) in out.iter().enumerate() {
+                let fast = d / st.spread(x, y, t.w, t.h).unwrap().sqrt() as f32;
+                let slow = ncc_at(&img, x as i64, y as i64, &t);
+                assert!((fast - slow).abs() < 1e-4, "{x},{y}: {fast} vs {slow}");
+            }
+        }
+    }
+}

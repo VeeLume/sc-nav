@@ -14,6 +14,7 @@
 //! rendered at 11 px: the overlay's digits are 8 px tall with 1 px strokes,
 //! on an 8 px advance. Verified readings add labelled exemplars.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use sc_nav_glyph::{Grammar, Params, Position, Slot};
@@ -90,8 +91,8 @@ fn band(lum: &Gray, top: usize) -> Option<Gray> {
             let mut px: Vec<f32> = (top..top + INK_ROWS)
                 .flat_map(|y| lum.v[y * lum.w + a..y * lum.w + z].iter().copied())
                 .collect();
-            px.sort_by(f32::total_cmp);
-            px[px.len() * 35 / 100]
+            let k = px.len() * 35 / 100;
+            *px.select_nth_unstable_by(k, f32::total_cmp).1
         })
         .collect();
     let mut v = lum.v[y0 * lum.w..(y0 + BAND) * lum.w].to_vec();
@@ -430,7 +431,14 @@ pub struct Matcher {
     /// Letters, digits and `_:` for reading names by dictionary; `None`:
     /// names aren't read.
     pub text: Option<TemplateSet>,
+    /// Numbers read in the current frame, by line, token and format: the
+    /// `Zone`, `Root` and `CamDir` searches read the same lines.
+    memo: RefCell<HashMap<NumberKey, Option<Number>>>,
 }
+
+/// A token of a line of the current frame (the line by its pixels'
+/// address, stable while the frame is read) in a format.
+type NumberKey = (usize, usize, usize, usize, usize, usize);
 
 /// What names are read with: every letter and digit, `_` and `:`.
 pub const TEXT_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_:";
@@ -496,6 +504,7 @@ impl Matcher {
             tuning: Tuning::default(),
             max_per_char: 120,
             text: None,
+            memo: RefCell::default(),
         }
     }
 
@@ -529,31 +538,41 @@ impl Matcher {
             gap: 7,
             ..self.tuning.glyph
         };
+        // n glyphs: the ink spans (n-1) advances plus most of the last glyph
+        const ADVANCE: f32 = 6.62;
+        let fits: Vec<(usize, usize)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(k, c)| (k, c.chars().count()))
+            .filter(|&(_, n)| {
+                let (lo, hi) = (ADVANCE * (n as f32 - 1.0) + 1.0, ADVANCE * n as f32 + 1.0);
+                n > 0 && ink as f32 >= lo - 1.5 && ink as f32 <= hi
+            })
+            .collect();
+        // the hits of every letter a fitting candidate has, found once
+        let wanted: String = fits
+            .iter()
+            .flat_map(|&(k, _)| candidates[k].chars())
+            .collect();
+        let sub = TemplateSet {
+            glyphs: set
+                .glyphs
+                .iter()
+                .filter(|(c, _)| wanted.contains(*c))
+                .cloned()
+                .collect(),
+            exemplars: vec![],
+        };
+        let glyphs = sc_nav_glyph::Line::new(&line, &sub, &params);
         let mut scores: Vec<(usize, f32)> = vec![];
-        for (k, cand) in candidates.iter().enumerate() {
-            let n = cand.chars().count();
-            const ADVANCE: f32 = 6.62;
-            // n glyphs: the ink spans (n-1) advances plus most of the last glyph
-            let (lo, hi) = (ADVANCE * (n as f32 - 1.0) + 1.0, ADVANCE * n as f32 + 1.0);
-            if n == 0 || (ink as f32) < lo - 1.5 || ink as f32 > hi {
-                continue;
-            }
-            let wanted: String = cand.chars().collect();
-            let sub = TemplateSet {
-                glyphs: set
-                    .glyphs
-                    .iter()
-                    .filter(|(c, _)| wanted.contains(*c))
-                    .cloned()
-                    .collect(),
-                exemplars: vec![],
-            };
+        for &(k, n) in &fits {
             let grammar = Grammar(
-                cand.chars()
+                candidates[k]
+                    .chars()
                     .map(|c| Slot::new(&c.to_string(), 1, 1))
                     .collect(),
             );
-            let Some(read) = sc_nav_glyph::read(&line, &sub, &grammar, &params) else {
+            let Some(read) = glyphs.read(&grammar) else {
                 continue;
             };
             let mean = read
@@ -641,6 +660,23 @@ impl Matcher {
     }
 
     fn number(&self, cov: &Gray, token: &[(usize, usize)], f: Format) -> Option<Number> {
+        let key = (
+            cov.v.as_ptr() as usize,
+            token.first()?.0,
+            token.last()?.1,
+            token.len(),
+            f.decimals,
+            f.suffix,
+        );
+        if let Some(n) = self.memo.borrow().get(&key) {
+            return n.clone();
+        }
+        let n = self.read_number(cov, token, f);
+        self.memo.borrow_mut().insert(key, n.clone());
+        n
+    }
+
+    fn read_number(&self, cov: &Gray, token: &[(usize, usize)], f: Format) -> Option<Number> {
         let rows_at = |x: usize| -> Vec<usize> {
             (MARGIN..MARGIN + INK_ROWS)
                 .filter(|&y| cov.get(x, y) > 0.45)
@@ -704,10 +740,10 @@ impl Matcher {
                 ])
             }
         };
-        let read: Vec<Position> =
-            sc_nav_glyph::read(&line, &self.set, &grammar(n, n), &self.tuning.glyph).or_else(
-                || sc_nav_glyph::read(&line, &self.set, &grammar(1, 9), &self.tuning.glyph),
-            )?;
+        let glyphs = sc_nav_glyph::Line::new(&line, &self.set, &self.tuning.glyph);
+        let read: Vec<Position> = glyphs
+            .read(&grammar(n, n))
+            .or_else(|| glyphs.read(&grammar(1, 9)))?;
         let ints = read.iter().filter(|p| p.slot == 0).count() as i32;
         let (mut i, mut d) = (0, 0);
         let mut digits = vec![];
@@ -798,6 +834,13 @@ impl Matcher {
     /// `bodies` (from nav-data) snap the read radius to a known body and
     /// unlock `Reading::root`; empty, the radius is taken as read.
     pub fn read(&self, lum: &Gray, offset: f64, bodies: &[sc_nav_geo::Body]) -> Outcome {
+        self.memo.borrow_mut().clear();
+        let out = self.read_frame(lum, offset, bodies);
+        self.memo.borrow_mut().clear();
+        out
+    }
+
+    fn read_frame(&self, lum: &Gray, offset: f64, bodies: &[sc_nav_geo::Body]) -> Outcome {
         let lines: Vec<Gray> = line_tops(lum)
             .into_iter()
             .filter_map(|t| band(lum, t))

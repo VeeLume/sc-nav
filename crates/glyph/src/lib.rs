@@ -22,6 +22,7 @@
 //! Pure: no capture, no IO, no platform code.
 
 mod gray;
+mod ncc;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -160,7 +161,12 @@ pub fn ncc_at(img: &Gray, x: i64, y: i64, t: &Gray) -> f32 {
 /// Every template's local score peaks along the line, by ink left edge.
 /// A template may sit a pixel above or below the line's own top/bottom.
 pub fn hits(line: &Gray, set: &TemplateSet, p: &Params) -> Vec<Hit> {
+    hits_with(line, &ncc::Stats::new(line), set, p)
+}
+
+fn hits_with(line: &Gray, stats: &ncc::Stats, set: &TemplateSet, p: &Params) -> Vec<Hit> {
     let mut out = Vec::new();
+    let (mut scores, mut dots) = (Vec::new(), Vec::new());
     for (ch, t) in &set.glyphs {
         if t.w > line.w || t.h > line.h + 2 {
             continue;
@@ -171,14 +177,24 @@ pub fn hits(line: &Gray, set: &TemplateSet, p: &Params) -> Vec<Hit> {
         let (Some(&il), Some(&ir)) = (cols.first(), cols.last()) else {
             continue;
         };
-        let top = line.h as i64 - t.h as i64 + 1;
-        let scores: Vec<f32> = (0..=line.w - t.w)
-            .map(|x| {
-                (-1..=top)
-                    .map(|y| ncc_at(line, x as i64, y, t))
-                    .fold(f32::MIN, f32::max)
-            })
-            .collect();
+        // the best over the rows the template fits in; a row a pixel off
+        // the line scores 0, so nothing scores below that
+        let nx = line.w - t.w + 1;
+        scores.clear();
+        scores.resize(nx, 0.0f32);
+        if t.h <= line.h
+            && let Some(u) = ncc::unit(t)
+        {
+            dots.resize(nx, 0.0f32);
+            for y in 0..=line.h - t.h {
+                ncc::row_dots(line, &u, t.w, t.h, y, &mut dots);
+                for (x, (s, &d)) in scores.iter_mut().zip(&dots).enumerate() {
+                    if let Some(var) = stats.spread(x, y, t.w, t.h) {
+                        *s = s.max(d / var.sqrt() as f32);
+                    }
+                }
+            }
+        }
         for x in 0..scores.len() {
             let v = scores[x];
             let lo = x.saturating_sub(p.peak_radius);
@@ -200,72 +216,114 @@ pub fn hits(line: &Gray, set: &TemplateSet, p: &Params) -> Vec<Hit> {
 /// The best string of `grammar` along the line: (slot, hit) per glyph,
 /// left to right; empty when no string of the grammar fits.
 pub fn place(line: &Gray, set: &TemplateSet, grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)> {
-    place_hits(&hits(line, set, p), grammar, p)
+    Line::new(line, set, p).place(grammar)
 }
 
 fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)> {
     let slots = &grammar.0;
-    if slots.is_empty() {
+    if slots.is_empty() || cands.is_empty() {
         return vec![];
     }
-    // (hit, slot, count in slot) → (best total, back pointer)
-    type Key = (usize, usize, usize);
-    let mut best: HashMap<Key, (f32, Option<Key>)> = HashMap::new();
+    // State (hit i, slot si, count cnt in the slot) at i * stride + at[si] +
+    // cnt - 1: the best total ending there and its back pointer.
+    let mut at = Vec::with_capacity(slots.len());
+    let mut stride = 0;
+    for s in slots {
+        at.push(stride);
+        stride += s.max;
+    }
+    let key = |i: usize, si: usize, cnt: usize| i * stride + at[si] + cnt - 1;
+    const NONE: usize = usize::MAX;
+    let mut val = vec![f32::NAN; cands.len() * stride];
+    let mut back = vec![NONE; cands.len() * stride];
+    let set = |val: &[f32], k: usize| !val[k].is_nan();
+    // a predecessor's ink ends at most `gap` before this one's starts, so it
+    // starts no earlier than that minus the widest hit
+    let widest = cands.iter().map(|c| c.w).max().unwrap_or(0);
+    let mut adjacent: Vec<usize> = vec![];
+    let mut row: Vec<(f32, usize)> = vec![];
     for (i, c) in cands.iter().enumerate() {
+        let first = cands[..i].partition_point(|q| q.x + widest + p.gap < c.x);
+        adjacent.clear();
+        adjacent.extend((first..i).filter(|&j| {
+            let q = &cands[j];
+            q.x + q.w <= c.x + p.overlap && c.x <= q.x + q.w + p.gap
+        }));
+        let gain = c.score - p.bias;
         for (si, slot) in slots.iter().enumerate() {
-            if !slot.chars.contains(c.ch) {
+            if slot.max == 0 || !slot.chars.contains(c.ch) {
                 continue;
             }
-            for cnt in 1..=slot.max {
-                let mut val: Option<(f32, Option<Key>)> =
-                    (si == 0 && cnt == 1).then_some((c.score - p.bias, None));
-                for (j, q) in cands[..i].iter().enumerate() {
-                    if !(q.x + q.w <= c.x + p.overlap && c.x <= q.x + q.w + p.gap) {
-                        continue;
+            // per count: the best total so far (NaN: none) and where from;
+            // the first predecessor wins ties
+            row.clear();
+            row.resize(slot.max, (f32::NAN, NONE));
+            if si == 0 {
+                row[0] = (gain, NONE);
+            }
+            for &j in &adjacent {
+                if si > 0 {
+                    // count 1: the best count the slot before allows, ties to
+                    // the larger
+                    let before = &slots[si - 1];
+                    let mut pick: Option<usize> = None;
+                    for k in before.min.max(1)..=before.max {
+                        let kk = key(j, si - 1, k);
+                        if set(&val, kk) && pick.is_none_or(|b| val[kk].total_cmp(&val[b]).is_ge())
+                        {
+                            pick = Some(kk);
+                        }
                     }
-                    let prev = if cnt > 1 {
-                        Some((j, si, cnt - 1))
-                    } else if si > 0 {
-                        let before = &slots[si - 1];
-                        (before.min..=before.max)
-                            .map(|k| (j, si - 1, k))
-                            .filter(|k| best.contains_key(k))
-                            .max_by(|a, b| best[a].0.total_cmp(&best[b].0))
-                    } else {
-                        None
-                    };
-                    if let Some(prev) = prev
-                        && let Some(&(pv, _)) = best.get(&prev)
-                    {
-                        let v = pv + c.score - p.bias;
-                        if val.is_none_or(|(cur, _)| v > cur) {
-                            val = Some((v, Some(prev)));
+                    if let Some(prev) = pick {
+                        let v = val[prev] + gain;
+                        if row[0].0.is_nan() || v > row[0].0 {
+                            row[0] = (v, prev);
                         }
                     }
                 }
-                if let Some(v) = val {
-                    best.insert((i, si, cnt), v);
+                // count n: the same slot's count n - 1 at j
+                let k0 = key(j, si, 1);
+                for (r, prev) in row[1..].iter_mut().zip(k0..) {
+                    let pv = val[prev];
+                    if pv.is_nan() {
+                        continue;
+                    }
+                    let v = pv + gain;
+                    if r.0.is_nan() || v > r.0 {
+                        *r = (v, prev);
+                    }
                 }
+            }
+            let k0 = key(i, si, 1);
+            for (n, &(v, prev)) in row.iter().enumerate() {
+                val[k0 + n] = v;
+                back[k0 + n] = prev;
             }
         }
     }
     let last = slots.len() - 1;
-    let (lo, hi) = (slots[last].min, slots[last].max);
-    let Some(mut k) = best
-        .iter()
-        .filter(|(k, _)| k.1 == last && (lo..=hi).contains(&k.2))
-        // ties go to the smallest key, whatever order the map yields
-        .max_by(|a, b| a.1.0.total_cmp(&b.1.0).then(b.0.cmp(a.0)))
-        .map(|(k, _)| *k)
-    else {
+    let (lo, hi) = (slots[last].min.max(1), slots[last].max);
+    // the best end; ties go to the smallest (hit, count)
+    let mut end: Option<usize> = None;
+    for i in 0..cands.len() {
+        for cnt in lo..=hi {
+            let k = key(i, last, cnt);
+            if set(&val, k) && end.is_none_or(|e| val[k].total_cmp(&val[e]).is_gt()) {
+                end = Some(k);
+            }
+        }
+    }
+    let Some(mut k) = end else {
         return vec![];
     };
     let mut out = Vec::new();
     loop {
-        out.push((k.1, cands[k.0]));
-        match best[&k].1 {
-            Some(prev) => k = prev,
-            None => break,
+        let (i, r) = (k / stride, k % stride);
+        let si = at.iter().rposition(|&a| a <= r).unwrap_or(0);
+        out.push((si, cands[i]));
+        match back[k] {
+            NONE => break,
+            prev => k = prev,
         }
     }
     out.reverse();
@@ -274,26 +332,33 @@ fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)>
 
 /// The exemplars of `allowed` chars around the glyph whose ink starts at
 /// `x` (width `w`), best first: one score per char, its nearest example.
+/// `units` are the exemplars centred and scaled to unit norm (`None`:
+/// flat), so a score is a dot product with the window, normalised once.
 fn name(
     line: &Gray,
+    stats: &ncc::Stats,
     set: &TemplateSet,
-    x: usize,
-    w: usize,
+    units: &[Option<Vec<f32>>],
+    (x, w): (usize, usize),
     allowed: &str,
     p: &Params,
 ) -> Vec<(char, f32)> {
     let mut per: BTreeMap<char, f32> = BTreeMap::new();
-    for (ch, g) in &set.exemplars {
+    // the line's windows per exemplar size, normalised
+    let mut windows: HashMap<(usize, usize), Vec<Vec<f32>>> = HashMap::new();
+    for ((ch, g), u) in set.exemplars.iter().zip(units) {
         if !allowed.contains(*ch) {
             continue;
         }
-        // the exemplar window centres the glyph's ink in its cell
-        let x0 = x as i64 - 1 - (g.w as i64 - 2 - w as i64) / 2;
-        let top = line.h as i64 - g.h as i64;
-        let mut b = f32::MIN;
-        for dx in -p.reach..=p.reach {
-            for y in -1..=top + 1 {
-                b = b.max(ncc_at(line, x0 + dx, y, g));
+        // a window a pixel above the line scores 0, so nothing scores below
+        // that (unless there are no windows at all)
+        let mut b = if p.reach >= 0 { 0.0f32 } else { f32::MIN };
+        if let Some(u) = u {
+            let ws = windows
+                .entry((g.w, g.h))
+                .or_insert_with(|| exemplar_windows(line, stats, x, w, g.w, g.h, p.reach));
+            for win in ws.iter() {
+                b = b.max(ncc::dot(win, u));
             }
         }
         let e = per.entry(*ch).or_insert(f32::MIN);
@@ -304,6 +369,44 @@ fn name(
     ranked
 }
 
+/// The line's `gw` x `gh` windows an exemplar is tried at, around the
+/// glyph whose ink starts at `x` (width `w`): centred, unit norm, the flat
+/// and the out-of-bounds ones left out.
+fn exemplar_windows(
+    line: &Gray,
+    stats: &ncc::Stats,
+    x: usize,
+    w: usize,
+    gw: usize,
+    gh: usize,
+    reach: i64,
+) -> Vec<Vec<f32>> {
+    // the exemplar window centres the glyph's ink in its cell
+    let x0 = x as i64 - 1 - (gw as i64 - 2 - w as i64) / 2;
+    let top = line.h as i64 - gh as i64;
+    let mut out = vec![];
+    for dx in -reach..=reach {
+        for y in -1..=top + 1 {
+            let wx = x0 + dx;
+            if wx < 0 || y < 0 || wx as usize + gw > line.w || y as usize + gh > line.h {
+                continue;
+            }
+            let (wx, wy) = (wx as usize, y as usize);
+            let Some(var) = stats.spread(wx, wy, gw, gh) else {
+                continue;
+            };
+            let (mean, k) = (stats.mean(wx, wy, gw, gh), var.sqrt());
+            let mut win = Vec::with_capacity(gw * gh);
+            for ry in wy..wy + gh {
+                let row = &line.v[ry * line.w + wx..ry * line.w + wx + gw];
+                win.extend(row.iter().map(|&v| ((v as f64 - mean) / k) as f32));
+            }
+            out.push(win);
+        }
+    }
+    out
+}
+
 /// Read the line as `grammar`: each placed glyph with its ranked
 /// candidates. `None` when no string of the grammar fits.
 pub fn read(
@@ -312,33 +415,98 @@ pub fn read(
     grammar: &Grammar,
     p: &Params,
 ) -> Option<Vec<Position>> {
-    let cands = hits(line, set, p);
-    let placed = place_hits(&cands, grammar, p);
-    if placed.is_empty() {
-        return None;
+    Line::new(line, set, p).read(grammar)
+}
+
+/// A line with its template hits found once, to place or read it as
+/// several grammars (e.g. an exact count first, a looser one if that
+/// fails, or one word per dictionary entry). Same results as [`place`]
+/// and [`read`] with the same arguments.
+pub struct Line<'a> {
+    line: &'a Gray,
+    set: &'a TemplateSet,
+    p: Params,
+    stats: ncc::Stats,
+    hits: Vec<Hit>,
+    /// The exemplars centred and scaled to unit norm, once one is needed.
+    units: std::cell::OnceCell<Vec<Option<Vec<f32>>>>,
+}
+
+impl<'a> Line<'a> {
+    pub fn new(line: &'a Gray, set: &'a TemplateSet, p: &Params) -> Self {
+        let stats = ncc::Stats::new(line);
+        let hits = hits_with(line, &stats, set, p);
+        Self {
+            line,
+            set,
+            p: *p,
+            stats,
+            hits,
+            units: Default::default(),
+        }
     }
-    let named: String = set.exemplars.iter().map(|(c, _)| *c).collect();
-    let out = placed
-        .into_iter()
-        .map(|(slot, h)| {
-            let allowed = &grammar.0[slot].chars;
-            let mut ranked = if named.contains(h.ch) {
-                name(line, set, h.x, h.w, allowed, p)
-            } else {
-                vec![]
-            };
-            if ranked.is_empty() {
-                ranked = spot_ranking(&cands, &h, allowed, p);
-            }
-            Position {
-                x: h.x,
-                w: h.w,
-                slot,
-                ranked,
-            }
-        })
-        .collect();
-    Some(out)
+
+    /// Every template's hits, as [`hits`] gives them.
+    pub fn hits(&self) -> &[Hit] {
+        &self.hits
+    }
+
+    /// The hits of chars the grammar has, in order: the others can't take
+    /// part in a placement.
+    fn usable(&self, grammar: &Grammar) -> Vec<Hit> {
+        self.hits
+            .iter()
+            .filter(|h| grammar.0.iter().any(|s| s.chars.contains(h.ch)))
+            .copied()
+            .collect()
+    }
+
+    /// As [`place`].
+    pub fn place(&self, grammar: &Grammar) -> Vec<(usize, Hit)> {
+        place_hits(&self.usable(grammar), grammar, &self.p)
+    }
+
+    /// As [`read`].
+    pub fn read(&self, grammar: &Grammar) -> Option<Vec<Position>> {
+        let cands = self.usable(grammar);
+        let placed = place_hits(&cands, grammar, &self.p);
+        if placed.is_empty() {
+            return None;
+        }
+        let set = self.set;
+        let out = placed
+            .into_iter()
+            .map(|(slot, h)| {
+                let allowed = &grammar.0[slot].chars;
+                let mut ranked = if set.exemplars.iter().any(|(c, _)| *c == h.ch) {
+                    let units = self
+                        .units
+                        .get_or_init(|| set.exemplars.iter().map(|(_, g)| ncc::unit(g)).collect());
+                    name(
+                        self.line,
+                        &self.stats,
+                        set,
+                        units,
+                        (h.x, h.w),
+                        allowed,
+                        &self.p,
+                    )
+                } else {
+                    vec![]
+                };
+                if ranked.is_empty() {
+                    ranked = spot_ranking(&cands, &h, allowed, &self.p);
+                }
+                Position {
+                    x: h.x,
+                    w: h.w,
+                    slot,
+                    ranked,
+                }
+            })
+            .collect();
+        Some(out)
+    }
 }
 
 /// The placed hit first, then the other allowed chars' best hits at the
