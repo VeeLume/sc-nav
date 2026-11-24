@@ -186,3 +186,33 @@ states, 52 to 61 times, on 44 to 70 uncertain digits.
   takes 549, 451 and 167 ms. The beam keeps the cheapest states, and a
   verified fit costs 0 or close, so a real fit survives the trim.
 - The overlay bench lists every grab over 500 ms (`slow:` on stderr).
+
+## Glyph reads (2026-11-24)
+
+Overlay bench, all 3,246 grabs, temporary timers per phase of
+`glyph::Line` (removed again). A grab runs ~75 placements over ~348 hits,
+each hit with ~43 neighbours.
+
+| phase, per grab | before | after |
+|---|---|---|
+| hits | 12.3 ms | 7.7 ms |
+| placement | 17.5 ms | 15.1 ms |
+| naming (incl. exemplar prep 2.0) | 19.4 ms | 14.0 ms |
+| whole read (mean) | 52.2 ms | 41.0 ms |
+
+Reads byte-identical. The changes:
+
+- Hits: each window's spread (box sums, √) is computed once per template
+  size per line instead of once per template.
+- Placement: which count ends a slot best at a hit, and the highest count
+  set there, are found once the hit is done instead of for every later
+  hit that follows it; the count loop is branch-free. Its cost is now the
+  number of (hit, neighbour, slot) steps, about 2 million per grab.
+- Naming: exemplars grouped by char once per line (an index per exemplar,
+  not a map lookup and a string search for each of up to 1,240), and
+  scored four windows at a time (`ncc::dot4`, each sum `dot`'s to the
+  bit). A dot4 path without its per-chunk check was slower (15 → 18 ms)
+  and was dropped.
+- Not done: exemplar prep (2 ms) is per `Line`. Keeping it across lines
+  needs an API that holds prepared templates next to the `TemplateSet`,
+  which overlay and Starlume both edit in place.

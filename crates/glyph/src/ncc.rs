@@ -95,6 +95,31 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// [`dot`] of four vectors with the same `b`: `b` is read once for all
+/// four, and each result is [`dot`]'s to the bit (the same sums in the
+/// same order).
+pub fn dot4(a: [&[f32]; 4], b: &[f32]) -> [f32; 4] {
+    let mut acc = [[0.0f32; 8]; 4];
+    let (cb, rb) = b.as_chunks::<8>();
+    let ca = a.map(|x| x.as_chunks::<8>().0);
+    for (k, y) in cb.iter().enumerate() {
+        for q in 0..4 {
+            let Some(x) = ca[q].get(k) else { continue };
+            for i in 0..8 {
+                acc[q][i] += x[i] * y[i];
+            }
+        }
+    }
+    std::array::from_fn(|q| {
+        let ra = &a[q][ca[q].len().min(cb.len()) * 8..];
+        let mut s: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+        for v in acc[q] {
+            s += v;
+        }
+        s
+    })
+}
+
 /// Scores of the unit template `u` (`w` x `h`) at every top-left
 /// (x, y) of `img` with x in `0..nx`, for one row offset `y`: the
 /// numerators, accumulated across x so the loop vectorises. `out` is
@@ -143,6 +168,19 @@ mod tests {
             *v = (s >> 8) as f32 / (1u32 << 24) as f32;
         }
         g
+    }
+
+    #[test]
+    fn dot4_is_dot_to_the_bit() {
+        let v = |n: usize, seed: u32| noise(n, 1, seed).v;
+        for n in [0, 3, 8, 13, 88, 97] {
+            let b = v(n, 9);
+            let a: Vec<Vec<f32>> = (0..4).map(|k| v(n, 20 + k)).collect();
+            let got = dot4([&a[0], &a[1], &a[2], &a[3]], &b);
+            for q in 0..4 {
+                assert_eq!(got[q].to_bits(), dot(&a[q], &b).to_bits(), "{n} {q}");
+            }
+        }
     }
 
     #[test]
