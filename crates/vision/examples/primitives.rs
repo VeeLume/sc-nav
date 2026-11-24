@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use image::RgbaImage;
 use sc_nav_vision::{
-    Correlator, Features, Gray, Scorer, Template, brightest, patch, peaks, rotate, rotate_rect,
+    Correlator, Features, Gray, Prepared, Scorer, Template, brightest, patch, peaks, rotate,
+    rotate_rect,
 };
 
 fn time<T>(name: &str, n: usize, mut f: impl FnMut() -> T) -> T {
@@ -142,7 +143,7 @@ fn main() {
     time("Scorer::best 13x13 spots x 9 scales", n, || {
         let mut best = f32::MIN;
         for t in &ts {
-            let u = Template::new(t).expect("not flat");
+            let Some(u) = Template::new(t) else { continue };
             let floor = 0.02 * u.spread();
             if let Some(b) = s.best(&u, 94..107, 394..407, floor) {
                 best = best.max(b.0);
@@ -151,6 +152,141 @@ fn main() {
         best
     });
     let _: &Gray = &fc.shadow;
+
+    // Starlume's whole-frame vote, upright: both half feature images
+    // correlated once, 4 part threads, each 5 scales x 5 templates, the
+    // bank's maps merged by max, 8 peaks per scale.
+    let halves = [f.ink.half(), f.shadow.half()];
+    let bank: Vec<Vec<Gray>> = (0..4)
+        .map(|p| {
+            (0..5)
+                .map(|i| {
+                    let (w, h) = (90.0 + 30.0 * p as f32, 18.0 + 4.0 * i as f32);
+                    patch(
+                        &f.ink,
+                        1880.0 + 7.0 * i as f32,
+                        550.0 + 60.0 * p as f32,
+                        1.0,
+                        (0.0, 0.0, w, h),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    const RELS: [f32; 5] = [0.88, 0.94, 1.0, 1.06, 1.12];
+    // one scale of one part: the bank's best map, its peaks
+    let scale = |corr: &[Correlator; 2],
+                 pi: usize,
+                 si: usize,
+                 prepared: Option<&Vec<Vec<Vec<Prepared>>>>,
+                 fast_merge: bool| {
+        let mut best: Option<Gray> = None;
+        for (ti, t) in bank[pi].iter().enumerate() {
+            let c = &corr[(pi + ti) % 2];
+            let m = match prepared {
+                Some(p) => c.ncc_prepared(&p[pi][si][ti]),
+                None => c.ncc(&t.resized(RELS[si] / 2.0)),
+            };
+            best = Some(match best {
+                None => m,
+                Some(mut b) if fast_merge && (b.w, b.h) == (m.w, m.h) => {
+                    for (a, &v) in b.v.iter_mut().zip(&m.v) {
+                        *a = a.max(v);
+                    }
+                    b
+                }
+                Some(b) => {
+                    let (w, h) = (b.w.min(m.w), b.h.min(m.h));
+                    let mut v = Vec::with_capacity(w * h);
+                    for y in 0..h {
+                        for x in 0..w {
+                            v.push(b.get(x, y).max(m.get(x, y)));
+                        }
+                    }
+                    Gray { w, h, v }
+                }
+            });
+        }
+        peaks(&best.expect("bank"), 8, 10, 0.2).len()
+    };
+    let vote = |prepared: Option<&Vec<Vec<Vec<Prepared>>>>, fast_merge: bool, per_scale: bool| {
+        let corr = [Correlator::new(&halves[0]), Correlator::new(&halves[1])];
+        std::thread::scope(|s| {
+            let jobs: Vec<Vec<(usize, usize)>> = if per_scale {
+                (0..4)
+                    .flat_map(|p| (0..5).map(move |k| vec![(p, k)]))
+                    .collect()
+            } else {
+                (0..4).map(|p| (0..5).map(|k| (p, k)).collect()).collect()
+            };
+            let hs: Vec<_> = jobs
+                .into_iter()
+                .map(|job| {
+                    let (corr, scale) = (&corr, &scale);
+                    s.spawn(move || {
+                        job.iter()
+                            .map(|&(p, k)| scale(corr, p, k, prepared, fast_merge))
+                            .sum::<usize>()
+                    })
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().expect("part"))
+                .sum::<usize>()
+        })
+    };
+    // PEAKS_OUT=<file>: every part's and scale's peaks over both feature
+    // images, to diff two builds.
+    if let Some(path) = std::env::var_os("PEAKS_OUT") {
+        let mut lines = Vec::new();
+        for (fi, half) in halves.iter().enumerate() {
+            let c = Correlator::new(half);
+            for (pi, ts) in bank.iter().enumerate() {
+                for rel in RELS {
+                    for (ti, t) in ts.iter().enumerate() {
+                        let m = c.ncc(&t.resized(rel / 2.0));
+                        for (v, x, y) in peaks(&m, 8, 10, 0.2) {
+                            lines.push(format!("{fi} {pi} {rel} {ti} {x} {y} {v:.5}"));
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::write(
+            path,
+            lines.join(
+                "
+",
+            ),
+        )
+        .expect("peaks file");
+    }
+    let n0 = time("vote, whole frame (4 threads)", 5, || {
+        vote(None, false, false)
+    });
+    let probe = Correlator::new(&halves[0]);
+    let prepared: Vec<Vec<Vec<Prepared>>> = bank
+        .iter()
+        .map(|ts| {
+            RELS.iter()
+                .map(|r| {
+                    ts.iter()
+                        .map(|t| probe.prepare(&t.resized(r / 2.0)).expect("fits"))
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let n1 = time("  + templates prepared once", 5, || {
+        vote(Some(&prepared), false, false)
+    });
+    let n2 = time("  + maps merged in place", 5, || {
+        vote(Some(&prepared), true, false)
+    });
+    let n3 = time("  + a thread per part and scale (20)", 5, || {
+        vote(Some(&prepared), true, true)
+    });
+    assert!(n0 == n1 && n1 == n2 && n2 == n3, "same peaks");
 }
 
 /// Starlume's names.rs slide, for comparison.

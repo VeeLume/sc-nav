@@ -3295,6 +3295,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "realfft"
+version = "3.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "538895ccf2006b473aafbe8d72770e21038961ab67aae34f3c577485fc703a7d"
+dependencies = [
+ "rustfft",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3664,6 +3673,7 @@ name = "sc-nav-vision"
 version = "0.1.0"
 dependencies = [
  "image",
+ "realfft",
  "rustfft",
  "sc-nav-glyph",
 ]

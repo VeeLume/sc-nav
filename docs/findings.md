@@ -134,3 +134,37 @@ features of the window 15.
 - Opening a WGC capture is the cost (~300 ms warm, 2 s cold). A kept
   `Session` copies the newest frame on the GPU and moves only the asked
   rectangle to the CPU.
+
+## Whole-frame panel search (2026-11-24)
+
+Starlume's full search (no panel on screen: 3.5 s) runs its vote five
+times: upright, then four tilts. Each vote is 4 part threads × 5 scales ×
+~5 templates, about 100 FFT correlations over the half frame (1280x720).
+Each tilt also rotates the frame (~70 ms) and recomputes its features
+(29 ms). The `primitives` example simulates the vote on a screenshot.
+
+| step (half frame) | before | after |
+|---|---|---|
+| `Correlator::new` | 11 ms | 5.6 ms |
+| `ncc`, 60x10 template | 19 ms | 7.6 ms |
+| `ncc_prepared` | 11 ms | 5.0 ms |
+| `peaks`, 8 | 4.4 ms | 1.6 ms |
+| simulated vote, 4 threads | 620 ms | 327 ms (238 with templates prepared once) |
+
+- Fresh 7 MB buffers per call cost their page faults every time: buffers
+  are now kept per thread. Exact.
+- The 2D FFT runs its rows in one call and its columns over a tiled
+  transpose: bit-identical, but only 6.3 → 5.9 ms. The column gather was
+  not the cost.
+- `peaks` scans for its maxima eight lanes at a time and finds the last
+  one block by block. Exact `max_by(total_cmp)`; zeros and NaN take the
+  plain scan.
+- Real-input transforms (realfft): half the spectrum, half the work and
+  memory. Maps equal the complex ones to rounding (tests: within 2e-5).
+  On 8 screenshots, every part's, scale's and template's peaks (14,000)
+  are the same set as before. The only change is one pair of exactly
+  tied scores that swapped order.
+- With 4 threads the vote is memory-bound: 20 threads (one per part and
+  scale) gain nothing. What is left on Starlume's side: preparing its
+  templates once per session (the frame size is fixed), and running the
+  four tilts at once instead of after each other.
