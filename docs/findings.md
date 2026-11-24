@@ -216,3 +216,44 @@ Reads byte-identical. The changes:
 - Not done: exemplar prep (2 ms) is per `Line`. Keeping it across lines
   needs an API that holds prepared templates next to the `TemplateSet`,
   which overlay and Starlume both edit in place.
+
+## Overlay line roles (2026-11-25)
+
+The `r_DisplayInfo` block is fixed to the screen, right-aligned, one line
+every ~13 px. Which line sits on which row is not fixed. Lines come and go
+with the player's state (a vehicle's or elevator's `Zone` line, the
+planet's `OOC` line, CamPos missing on foot), and each one moves every line
+below it. The line finder also reports rows between grid rows (on the
+yellow and orange lines, which the min-over-RGB luminance makes faint).
+
+Over the recorded sessions, the set of line rows:
+
+| session | grabs | row sets | changes between grabs |
+|---|---|---|---|
+| 1794434626 | 1,164 | 44 | 284 |
+| 1794440111 | 286 | 30 | 81 |
+| 1794442146 | 1,748 | 152 | 571 |
+| 1794444000 | 48 | 6 | 10 |
+
+The `Root` search was 60% of a read: it went up from CamPos line by line,
+reading each line's last three tokens as km and as metres, about 34 number
+reads per grab. Now the reader remembers the row and label shape (the ink
+widths of `Zone:`, `Root`, `Pos:`) of the line it took, and tries that line
+first when a line with the same label shape is on that row. It then checks
+lower lines with a `Zone:`-shaped label, because the full search takes the
+lowest line that agrees. In Stanton, `SolarSystem` (just above `Root`)
+prints the same position, and a frame where `Root` didn't read teaches the
+`SolarSystem` row. When the remembered line doesn't check out, every line
+is searched as before.
+
+- Number reads per grab: ~45 → 32.7. Reads byte-identical on all 3,246
+  grabs. Without the lower-line check, 3 reads took `SolarSystem`'s
+  decimetres. With a row hint alone, without the label check, 59 reads
+  differed, because reads teach exemplars and one changed read changes
+  later frames too.
+- Wall time was measured with the game running (~10 cores busy). Old and
+  new alternated on session 1794442146: mean 92 → 75 ms and 102 → 51 ms.
+  On a quiet machine the first version (row hint only) measured 41 → 30 ms.
+- The radius line and the location name still scan every line. The full
+  scan's result (the lowest qualifying line, the best name over all lines)
+  can only be kept exactly by reading the lines a hint would skip.

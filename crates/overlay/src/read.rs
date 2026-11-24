@@ -437,6 +437,40 @@ pub struct Matcher {
     /// Numbers read in the current frame, by line, token and format: the
     /// `Zone`, `Root` and `CamDir` searches read the same lines.
     memo: RefCell<HashMap<NumberKey, Option<Number>>>,
+    /// Where lines were found in earlier frames, tried first.
+    roles: RefCell<Roles>,
+}
+
+/// The overlay's lines by what they are, learned from frames that read:
+/// the row (line top, pixels) each was found on. The overlay is fixed to
+/// the screen, but lines come and go with what the player is doing (a
+/// vehicle's `Zone` line, the planet's), moving every line below them, so
+/// a row is only a guess: the line found there must check out as before,
+/// and when it doesn't the search runs over every line as without it.
+#[derive(Debug, Default, Clone)]
+struct Roles {
+    /// The `Zone: Root` line (the lowest that agreed with CamPos).
+    root: Option<Row>,
+}
+
+/// Where a line was and the shape of its label.
+#[derive(Debug, Clone, PartialEq)]
+struct Row {
+    top: usize,
+    /// The ink widths of the tokens before the line's last three (the
+    /// numbers): `Zone:`, `Root`, `Pos:`.
+    label: Vec<usize>,
+}
+
+impl Row {
+    fn of(top: usize, line: &Gray) -> Self {
+        let t = tokens(line);
+        let label = t[..t.len().saturating_sub(3)]
+            .iter()
+            .map(|tok| tok.last().map_or(0, |l| l.1) - tok.first().map_or(0, |f| f.0))
+            .collect();
+        Self { top, label }
+    }
 }
 
 /// A token of a line of the current frame (the line by its pixels'
@@ -508,6 +542,7 @@ impl Matcher {
             max_per_char: 120,
             text: None,
             memo: RefCell::default(),
+            roles: Default::default(),
         }
     }
 
@@ -844,10 +879,10 @@ impl Matcher {
     }
 
     fn read_frame(&self, lum: &Gray, offset: f64, bodies: &[sc_nav_geo::Body]) -> Outcome {
-        let lines: Vec<Gray> = line_tops(lum)
+        let (tops, lines): (Vec<usize>, Vec<Gray>) = line_tops(lum)
             .into_iter()
-            .filter_map(|t| band(lum, t))
-            .collect();
+            .filter_map(|t| band(lum, t).map(|b| (t, b)))
+            .unzip();
         // The radius line: radius, elevation and altitude at tokens -5, -3
         // and -1. CamPos is the line above it; when the game doesn't print
         // CamPos (landed, on foot), the `Zone: OOC_*` line further up stands in.
@@ -913,10 +948,12 @@ impl Matcher {
                 Search::Found { vals, cost, glyphs } => (vals, cost, glyphs),
             };
             let cam = [vals[0], vals[1], vals[2]];
-            let root = self.root(&lines[..above], cam, &near).map(|(r, g)| {
-                glyphs.extend(g);
-                r
-            });
+            let root = self
+                .root(&lines[..above], &tops[..above], cam, &near)
+                .map(|(r, g)| {
+                    glyphs.extend(g);
+                    r
+                });
             let body = body.or_else(|| {
                 // several bodies share the radius: Root says which
                 let r = root?;
@@ -1037,11 +1074,12 @@ impl Matcher {
     fn root(
         &self,
         lines: &[Gray],
+        tops: &[usize],
         cam: [f64; 3],
         bodies: &[&sc_nav_geo::Body],
     ) -> Option<([f64; 3], Glyphs)> {
         let hyp = cam[0].hypot(cam[1]);
-        for line in lines.iter().rev() {
+        let read = |line: &Gray| -> Option<([f64; 3], Glyphs)> {
             for nums in self.three_any(line) {
                 let top: Vec<f64> = nums.iter().map(Number::top).collect();
                 for b in bodies {
@@ -1065,8 +1103,45 @@ impl Matcher {
                     }
                 }
             }
-        }
-        None
+            None
+        };
+        // The line on the row it was on last, if its label has the same
+        // shape, then every line, lowest first. (In Stanton the
+        // `SolarSystem` line just above `Root` prints the same position; a
+        // line appearing higher up moves it onto the learned row, and its
+        // label tells it apart.)
+        let learned = self.roles.borrow().root.clone();
+        let hinted = learned.and_then(|row| {
+            let k = tops.iter().position(|&t| t == row.top)?;
+            (Row::of(tops[k], &lines[k]) == row).then_some(k)
+        });
+        let found = hinted
+            .and_then(|k| read(&lines[k]).map(|r| (k, r)))
+            .map(|mut best| {
+                // a lower `Zone:` line that agrees too is the one the full
+                // search takes (the row may hold `SolarSystem`, learned on a
+                // frame where `Root` didn't read)
+                let zone = |k: usize| Row::of(tops[k], &lines[k]).label.first().copied();
+                let first = zone(best.0);
+                for (j, line) in lines.iter().enumerate().skip(best.0 + 1) {
+                    if zone(j) != first {
+                        break;
+                    }
+                    match read(line) {
+                        Some(r) => best = (j, r),
+                        None => break,
+                    }
+                }
+                best
+            })
+            .or_else(|| {
+                (0..lines.len())
+                    .rev()
+                    .find_map(|k| read(&lines[k]).map(|r| (k, r)))
+            });
+        let (k, r) = found?;
+        self.roles.borrow_mut().root = Some(Row::of(tops[k], &lines[k]));
+        Some(r)
     }
 
     /// Search each digit's candidates for the cheapest values that `fits`.
