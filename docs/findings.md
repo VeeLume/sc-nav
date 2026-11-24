@@ -99,3 +99,38 @@ After, per frame (session 1794442146 dominates): number reads ~46 ms (hits
 search reads most lines above the radius line, the checksum search ~6 ms.
 The worst grab (9-10 s, session 1794442146) is the beam search at its
 300,000-state cap, before and after.
+
+## Vision primitives and window capture speed (2026-11-24)
+
+Bench: `cargo run --release -p sc-nav-vision --example primitives -- <screenshot>`
+on a 2560x1440 Starlume screenshot (medians of 7), and
+`cargo run --release -p sc-nav-capture --example window -- <exe>` for the
+capture. Starlume's near search (panel on screen, 33 screenshots) spent
+about 180 ms per read: names 80, refine 33, digits 26, the vote 25 (wall),
+features of the window 15.
+
+| step | before | after | same output |
+|---|---|---|---|
+| `Features::of`, whole frame | 155 ms | 29 ms | exact |
+| `Features::of`, 572x700 window | 16 ms | 3 ms | exact |
+| tilted window (rotate the frame, crop) | 79 ms | 7.5 ms (`rotate_rect`) | exact |
+| FFT NCC, 60x10 template on the half frame | 19 ms | 11 ms (`Prepared`) | exact |
+| 40 names slid over a 300x30 band | 123 ms | 15 ms (`Scorer`) | scores within 5e-6 |
+| refine-sized check (13x13 spots, 9 scales, 200x20) | 6.2 ms | 1.8 + 1.1 (`Scorer::new`) | scores to float rounding |
+| game window, one shot | ~300 ms (opening) | 3.8 ms whole 1920x1032, 0.9 ms a 600x700 region (`Session`) | same pixels |
+
+- The shadow ink's 5x5 closing was slow because the filter took `max`/`min`
+  as a function pointer, called per pixel. Now it is generic and runs on
+  whole slices. Max and min are exact in any order.
+- A whole-frame `rotate` is still ~70 ms, and that is arithmetic: 0° costs
+  the same. Making it faster without changing a pixel needs SIMD across
+  pixels. Only the full search's tilts pay this cost; a tracked panel turns
+  just its window.
+- A correlator plans its transforms once and is `Sync`, so one per feature
+  image can be shared by threads. A `Prepared` template saves the template's
+  forward transform for every correlator with the same padded size. A
+  reader that keeps its search window's size fixed transforms each template
+  once per session.
+- Opening a WGC capture is the cost (~300 ms warm, 2 s cold). A kept
+  `Session` copies the newest frame on the GPU and moves only the asked
+  rectangle to the CPU.

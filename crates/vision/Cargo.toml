@@ -12,3 +12,6 @@ repository.workspace = true
 sc-nav-glyph = { workspace = true }
 image = { version = "0.25", default-features = false }
 rustfft = "6"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

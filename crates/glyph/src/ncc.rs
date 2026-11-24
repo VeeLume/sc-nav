@@ -2,6 +2,10 @@
 //! unit norm once, window sums of the image from summed-area tables, so a
 //! score is one dot product. Same scores as [`crate::ncc_at`] up to float
 //! rounding.
+//!
+//! Public for other readers' template searches (sc-nav-vision's direct
+//! NCC): the score of unit template `u` at (x, y) is the numerator from
+//! [`row_dots_at`] over `spread(x, y, w, h).sqrt()`.
 
 use crate::Gray;
 
@@ -9,7 +13,7 @@ use crate::Gray;
 const FLAT: f64 = 1e-6;
 
 /// `t` minus its mean, scaled to unit norm; `None` for a flat template.
-pub(crate) fn unit(t: &Gray) -> Option<Vec<f32>> {
+pub fn unit(t: &Gray) -> Option<Vec<f32>> {
     let n = t.v.len() as f64;
     let mean = t.v.iter().map(|&v| v as f64).sum::<f64>() / n;
     let var: f64 = t.v.iter().map(|&v| (v as f64 - mean).powi(2)).sum();
@@ -25,14 +29,14 @@ pub(crate) fn unit(t: &Gray) -> Option<Vec<f32>> {
 }
 
 /// Summed-area tables of an image and of its square, for window variances.
-pub(crate) struct Stats {
+pub struct Stats {
     w1: usize,
     s: Vec<f64>,
     ss: Vec<f64>,
 }
 
 impl Stats {
-    pub(crate) fn new(img: &Gray) -> Self {
+    pub fn new(img: &Gray) -> Self {
         let w1 = img.w + 1;
         let mut s = vec![0.0; w1 * (img.h + 1)];
         let mut ss = vec![0.0; w1 * (img.h + 1)];
@@ -57,20 +61,26 @@ impl Stats {
     }
 
     /// Σ(v − mean)² over the window, or `None` when it is flat.
-    pub(crate) fn spread(&self, x: usize, y: usize, w: usize, h: usize) -> Option<f64> {
-        let (s, ss) = self.sums(x, y, w, h);
-        let var = ss - s * s / (w * h) as f64;
+    pub fn spread(&self, x: usize, y: usize, w: usize, h: usize) -> Option<f64> {
+        let var = self.var(x, y, w, h);
         (var > FLAT).then_some(var)
     }
 
+    /// Σ(v − mean)² over the window, flat or not. The window must lie in
+    /// the image.
+    pub fn var(&self, x: usize, y: usize, w: usize, h: usize) -> f64 {
+        let (s, ss) = self.sums(x, y, w, h);
+        ss - s * s / (w * h) as f64
+    }
+
     /// The window's mean.
-    pub(crate) fn mean(&self, x: usize, y: usize, w: usize, h: usize) -> f64 {
+    pub fn mean(&self, x: usize, y: usize, w: usize, h: usize) -> f64 {
         self.sums(x, y, w, h).0 / (w * h) as f64
     }
 }
 
 /// Dot product, eight lanes at a time.
-pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     let ((ca, ra), (cb, rb)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
     for (x, y) in ca.iter().zip(cb) {
@@ -89,11 +99,25 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// (x, y) of `img` with x in `0..nx`, for one row offset `y`: the
 /// numerators, accumulated across x so the loop vectorises. `out` is
 /// overwritten.
-pub(crate) fn row_dots(img: &Gray, u: &[f32], w: usize, h: usize, y: usize, out: &mut [f32]) {
+pub fn row_dots(img: &Gray, u: &[f32], w: usize, h: usize, y: usize, out: &mut [f32]) {
+    row_dots_at(img, u, w, h, 0, y, out);
+}
+
+/// [`row_dots`] for x in `x0..x0 + out.len()`. The template must fit at
+/// every one of them.
+pub fn row_dots_at(
+    img: &Gray,
+    u: &[f32],
+    w: usize,
+    h: usize,
+    x0: usize,
+    y: usize,
+    out: &mut [f32],
+) {
     let nx = out.len();
     out.fill(0.0);
     for ty in 0..h {
-        let row = &img.v[(y + ty) * img.w..(y + ty + 1) * img.w];
+        let row = &img.v[(y + ty) * img.w + x0..(y + ty + 1) * img.w];
         for tx in 0..w {
             let c = u[ty * w + tx];
             if c == 0.0 {

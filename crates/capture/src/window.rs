@@ -1,12 +1,19 @@
-//! One frame of the Star Citizen window, through Windows Graphics Capture:
-//! the same path OBS's window capture takes, so it works while Starlume is
-//! in front and with the game borderless or windowed. A minimised game has
-//! no frames to give.
+//! The Star Citizen window through Windows Graphics Capture: the same path
+//! OBS's window capture takes, so it works while another app is in front
+//! and with the game borderless or windowed. A minimised game has no frames
+//! to give.
 //!
-//! One-shot: a capture session is opened, the first frame copied to the
-//! CPU, and everything closed again. Nothing keeps running between shots
-//! (an app's idle footprint stays small). Moved from Starlume's
-//! `svc-capture::window`; frames are [`image::RgbaImage`].
+//! Two ways in:
+//! - [`capture_game`]: one shot. A capture session is opened, the first
+//!   frame copied to the CPU, and everything closed again; nothing keeps
+//!   running between shots (an app's idle footprint stays small).
+//! - [`Session`]: kept open for reading several times a second. The
+//!   device, the capture and the CPU copy are set up once; each call hands
+//!   out the newest frame, whole ([`Session::frame`]) or only a rectangle
+//!   of it ([`Session::region`]), which is all that leaves the GPU.
+//!
+//! Moved from Starlume's `svc-capture::window`; frames are
+//! [`image::RgbaImage`].
 
 use image::RgbaImage as Frame;
 
@@ -39,9 +46,71 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+/// The game's executable, whose window is captured.
+const GAME_EXE: &str = "StarCitizen.exe";
+
 /// Capture the game window now.
 pub fn capture_game() -> Result<Frame, CaptureError> {
-    imp::capture_game()
+    Session::open()?.frame()
+}
+
+/// A rectangle of a frame and where it sits in the window.
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// Its top-left in window pixels (the asked one, clamped to the window).
+    pub x: u32,
+    pub y: u32,
+    pub image: Frame,
+}
+
+/// A capture of one window, kept open between frames. Dropping it ends the
+/// capture.
+///
+/// Calls take `&mut self` (one GPU context); the session may move between
+/// threads.
+pub struct Session(imp::Session);
+
+impl Session {
+    /// Open a capture of the game window.
+    pub fn open() -> Result<Self, CaptureError> {
+        Self::open_exe(GAME_EXE)
+    }
+
+    /// Open a capture of the visible, titled top-level window of the
+    /// process running `exe` (a file name such as `notepad.exe`, any
+    /// case): tools and tests without the game. A missing window is
+    /// [`CaptureError::NoWindow`].
+    pub fn open_exe(exe: &str) -> Result<Self, CaptureError> {
+        imp::Session::open(exe).map(Self)
+    }
+
+    /// The window's size in pixels, as of the newest frame (0 x 0 before
+    /// the first).
+    pub fn size(&self) -> (u32, u32) {
+        self.0.size()
+    }
+
+    /// The newest frame, whole. Waits (up to two seconds) only when none has
+    /// arrived since the session opened.
+    pub fn frame(&mut self) -> Result<Frame, CaptureError> {
+        let (w, h) = self.0.newest()?;
+        self.0.copy(0, 0, w, h)
+    }
+
+    /// The rectangle (`x`, `y`, `w`, `h`) of the newest frame, clamped to
+    /// the window; only that leaves the GPU. A rectangle entirely outside
+    /// the window comes back empty (0 x 0) at the clamped corner.
+    pub fn region(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Region, CaptureError> {
+        let (fw, fh) = self.0.newest()?;
+        let (x, y) = (x.min(fw), y.min(fh));
+        let (w, h) = (w.min(fw - x), h.min(fh - y));
+        let image = if w == 0 || h == 0 {
+            Frame::new(0, 0)
+        } else {
+            self.0.copy(x, y, w, h)?
+        };
+        Ok(Region { x, y, image })
+    }
 }
 
 #[cfg(windows)]
@@ -49,16 +118,18 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows::Graphics::Capture::{
-        Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+        Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem,
+        GraphicsCaptureSession,
     };
     use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
     use windows::Graphics::DirectX::DirectXPixelFormat;
+    use windows::Graphics::SizeInt32;
     use windows::Win32::Foundation::{CloseHandle, HMODULE, HWND, LPARAM, MAX_PATH};
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+        D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
     };
     use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::Win32::System::Threading::{
@@ -70,11 +141,17 @@ mod imp {
     };
     use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible,
     };
     use windows::core::{BOOL, Interface, PWSTR};
 
     use super::{CaptureError, Frame};
+
+    const FORMAT: DirectXPixelFormat = DirectXPixelFormat::B8G8R8A8UIntNormalized;
+    /// Frames the pool holds: one being copied, one arriving.
+    const BUFFERS: i32 = 2;
+    const FIRST_FRAME: Duration = Duration::from_secs(2);
 
     fn os(e: windows::core::Error) -> CaptureError {
         CaptureError::Os(e.message().to_string())
@@ -103,129 +180,288 @@ mod imp {
         path.rsplit(['\\', '/']).next().map(str::to_string)
     }
 
-    /// The visible, titled top-level window of StarCitizen.exe.
-    fn game_window() -> Option<HWND> {
-        unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> BOOL {
-            let found = unsafe { &mut *(found.0 as *mut Option<HWND>) };
+    /// The visible, titled top-level window of the process running `exe`.
+    fn window_of(exe: &str) -> Option<HWND> {
+        struct Search<'a> {
+            exe: &'a str,
+            found: Option<HWND>,
+        }
+        unsafe extern "system" fn each(hwnd: HWND, search: LPARAM) -> BOOL {
+            let search = unsafe { &mut *(search.0 as *mut Search) };
             let titled = unsafe { GetWindowTextLengthW(hwnd) } > 0;
             if titled
                 && unsafe { IsWindowVisible(hwnd) }.as_bool()
-                && exe_of(hwnd).is_some_and(|e| e.eq_ignore_ascii_case("StarCitizen.exe"))
+                && exe_of(hwnd).is_some_and(|e| e.eq_ignore_ascii_case(search.exe))
             {
-                *found = Some(hwnd);
+                search.found = Some(hwnd);
                 return BOOL(0);
             }
             BOOL(1)
         }
-        let mut found: Option<HWND> = None;
+        let mut search = Search { exe, found: None };
         unsafe {
-            let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
+            let _ = EnumWindows(Some(each), LPARAM(&mut search as *mut _ as isize));
         }
-        found
+        search.found
     }
 
-    pub fn capture_game() -> Result<Frame, CaptureError> {
-        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
-            return Err(CaptureError::Unsupported);
-        }
-        let hwnd = game_window().ok_or(CaptureError::NoWindow)?;
-        if unsafe { IsIconic(hwnd) }.as_bool() {
-            return Err(CaptureError::Minimised);
-        }
-        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-            .map_err(os)?;
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }.map_err(os)?;
+    fn texture(
+        device: &ID3D11Device,
+        desc: &D3D11_TEXTURE2D_DESC,
+    ) -> Result<ID3D11Texture2D, CaptureError> {
+        let mut t: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(desc, None, Some(&mut t)) }.map_err(os)?;
+        t.ok_or_else(|| CaptureError::Os("no texture".into()))
+    }
 
-        let mut device: Option<ID3D11Device> = None;
-        let mut context: Option<ID3D11DeviceContext> = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )
+    /// A texture's description with this size, usage and CPU access.
+    fn like(
+        base: &D3D11_TEXTURE2D_DESC,
+        w: u32,
+        h: u32,
+        usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE,
+        cpu: u32,
+    ) -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
+            Usage: usage,
+            BindFlags: 0,
+            CPUAccessFlags: cpu,
+            MiscFlags: 0,
+            ..*base
         }
-        .map_err(os)?;
-        let device = device.ok_or_else(|| CaptureError::Os("no D3D11 device".into()))?;
-        let context = context.ok_or_else(|| CaptureError::Os("no D3D11 context".into()))?;
-        let dxgi: IDXGIDevice = device.cast().map_err(os)?;
-        let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
-            .map_err(os)?
-            .cast()
-            .map_err(os)?;
+    }
 
-        let size = item.Size().map_err(os)?;
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &d3d,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,
-            size,
-        )
-        .map_err(os)?;
-        let session = pool.CreateCaptureSession(&item).map_err(os)?;
-        // Windows 11: no yellow capture border, no cursor. Older builds lack
-        // these; the shot still works.
-        let _ = session.SetIsBorderRequired(false);
-        let _ = session.SetIsCursorCaptureEnabled(false);
-        session.StartCapture().map_err(os)?;
+    pub struct Session {
+        hwnd: HWND,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        d3d: IDirect3DDevice,
+        pool: Direct3D11CaptureFramePool,
+        session: GraphicsCaptureSession,
+        /// The pool's frame size; recreated when the window's size changes.
+        pool_size: SizeInt32,
+        /// The newest frame's content, kept on the GPU, and its size.
+        latest: Option<(ID3D11Texture2D, u32, u32)>,
+        /// The CPU-readable copy, reused while the asked size stays.
+        staging: Option<(ID3D11Texture2D, u32, u32)>,
+    }
 
-        let start = Instant::now();
-        let frame = loop {
-            if let Ok(f) = pool.TryGetNextFrame() {
-                break f;
+    // SAFETY: the WinRT capture objects are agile (the pool is free-threaded)
+    // and the D3D11 device and immediate context may be used from any thread
+    // as long as not from two at once, which `&mut self` on every use that
+    // touches the context guarantees.
+    unsafe impl Send for Session {}
+
+    impl Session {
+        pub fn open(exe: &str) -> Result<Self, CaptureError> {
+            if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+                return Err(CaptureError::Unsupported);
             }
-            if start.elapsed() > Duration::from_secs(2) {
-                let _ = session.Close();
-                let _ = pool.Close();
-                return Err(CaptureError::Timeout);
+            let hwnd = window_of(exe).ok_or(CaptureError::NoWindow)?;
+            if unsafe { IsIconic(hwnd) }.as_bool() {
+                return Err(CaptureError::Minimised);
             }
-            std::thread::sleep(Duration::from_millis(8));
-        };
+            let interop =
+                windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+                    .map_err(os)?;
+            let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(hwnd) }.map_err(os)?;
 
-        let result = (|| {
+            let mut device: Option<ID3D11Device> = None;
+            let mut context: Option<ID3D11DeviceContext> = None;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_HARDWARE,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .map_err(os)?;
+            let device = device.ok_or_else(|| CaptureError::Os("no D3D11 device".into()))?;
+            let context = context.ok_or_else(|| CaptureError::Os("no D3D11 context".into()))?;
+            let dxgi: IDXGIDevice = device.cast().map_err(os)?;
+            let d3d: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
+                .map_err(os)?
+                .cast()
+                .map_err(os)?;
+
+            let pool_size = item.Size().map_err(os)?;
+            let pool =
+                Direct3D11CaptureFramePool::CreateFreeThreaded(&d3d, FORMAT, BUFFERS, pool_size)
+                    .map_err(os)?;
+            let session = pool.CreateCaptureSession(&item).map_err(os)?;
+            // Windows 11: no yellow capture border, no cursor. Older builds
+            // lack these; the capture still works.
+            let _ = session.SetIsBorderRequired(false);
+            let _ = session.SetIsCursorCaptureEnabled(false);
+            session.StartCapture().map_err(os)?;
+            Ok(Self {
+                hwnd,
+                device,
+                context,
+                d3d,
+                pool,
+                session,
+                pool_size,
+                latest: None,
+                staging: None,
+            })
+        }
+
+        pub fn size(&self) -> (u32, u32) {
+            self.latest.as_ref().map_or((0, 0), |l| (l.1, l.2))
+        }
+
+        /// Take every frame waiting in the pool into `latest`; wait for the
+        /// first one if there is none yet. The newest frame's size.
+        pub fn newest(&mut self) -> Result<(u32, u32), CaptureError> {
+            if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
+                return Err(CaptureError::NoWindow);
+            }
+            if unsafe { IsIconic(self.hwnd) }.as_bool() {
+                return Err(CaptureError::Minimised);
+            }
+            let start = Instant::now();
+            loop {
+                let mut newest = None;
+                while let Ok(f) = self.pool.TryGetNextFrame() {
+                    if let Some(old) = newest.replace(f) {
+                        let _ = old.Close();
+                    }
+                }
+                if let Some(f) = newest {
+                    let taken = self.take(&f);
+                    let _ = f.Close();
+                    taken?;
+                }
+                if let Some(l) = &self.latest {
+                    return Ok((l.1, l.2));
+                }
+                if start.elapsed() > FIRST_FRAME {
+                    return Err(CaptureError::Timeout);
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+        }
+
+        /// Keep `frame`'s content in `latest`; follow a window resize.
+        fn take(&mut self, frame: &Direct3D11CaptureFrame) -> Result<(), CaptureError> {
+            let content = frame.ContentSize().map_err(os)?;
             let access: IDirect3DDxgiInterfaceAccess =
                 frame.Surface().map_err(os)?.cast().map_err(os)?;
-            let texture: ID3D11Texture2D = unsafe { access.GetInterface() }.map_err(os)?;
+            let surface: ID3D11Texture2D = unsafe { access.GetInterface() }.map_err(os)?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { texture.GetDesc(&mut desc) };
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.BindFlags = 0;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-            desc.MiscFlags = 0;
-            let mut staging: Option<ID3D11Texture2D> = None;
-            unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.map_err(os)?;
-            let staging = staging.ok_or_else(|| CaptureError::Os("no staging texture".into()))?;
-            unsafe { context.CopyResource(&staging, &texture) };
+            unsafe { surface.GetDesc(&mut desc) };
+            // The content can be smaller than the surface (the window shrank)
+            // or larger (it grew: clipped until the pool follows).
+            let w = (content.Width.max(0) as u32).min(desc.Width);
+            let h = (content.Height.max(0) as u32).min(desc.Height);
+            let resized =
+                content.Width != self.pool_size.Width || content.Height != self.pool_size.Height;
+            if resized && content.Width > 0 && content.Height > 0 {
+                self.pool
+                    .Recreate(&self.d3d, FORMAT, BUFFERS, content)
+                    .map_err(os)?;
+                self.pool_size = content;
+            }
+            if w == 0 || h == 0 {
+                return Ok(());
+            }
+            if self.latest.as_ref().is_none_or(|l| (l.1, l.2) != (w, h)) {
+                let t = texture(&self.device, &like(&desc, w, h, D3D11_USAGE_DEFAULT, 0))?;
+                self.latest = Some((t, w, h));
+            }
+            let (latest, _, _) = self.latest.as_ref().expect("set above");
+            let area = D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: w,
+                bottom: h,
+                back: 1,
+            };
+            unsafe {
+                self.context
+                    .CopySubresourceRegion(latest, 0, 0, 0, 0, &surface, 0, Some(&area))
+            };
+            Ok(())
+        }
+
+        /// The rectangle of `latest` to the CPU, as RGBA. In bounds (the
+        /// caller clamps) and not empty.
+        pub fn copy(&mut self, x: u32, y: u32, w: u32, h: u32) -> Result<Frame, CaptureError> {
+            let Some((latest, _, _)) = &self.latest else {
+                return Err(CaptureError::Timeout);
+            };
+            if self.staging.as_ref().is_none_or(|s| (s.1, s.2) != (w, h)) {
+                let mut base = D3D11_TEXTURE2D_DESC::default();
+                unsafe { latest.GetDesc(&mut base) };
+                let desc = like(
+                    &base,
+                    w,
+                    h,
+                    D3D11_USAGE_STAGING,
+                    D3D11_CPU_ACCESS_READ.0 as u32,
+                );
+                self.staging = Some((texture(&self.device, &desc)?, w, h));
+            }
+            let (staging, _, _) = self.staging.as_ref().expect("set above");
+            let area = D3D11_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + w,
+                bottom: y + h,
+                back: 1,
+            };
+            unsafe {
+                self.context
+                    .CopySubresourceRegion(staging, 0, 0, 0, 0, latest, 0, Some(&area))
+            };
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-                .map_err(os)?;
-            let (w, h) = (desc.Width, desc.Height);
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for y in 0..h {
-                let row = unsafe {
+            unsafe {
+                self.context
+                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            }
+            .map_err(os)?;
+            let row = (w * 4) as usize;
+            let mut rgba = vec![0u8; row * h as usize];
+            for (y, out) in rgba.chunks_exact_mut(row).enumerate() {
+                let src = unsafe {
                     std::slice::from_raw_parts(
-                        (mapped.pData as *const u8).add((y * mapped.RowPitch) as usize),
-                        (w * 4) as usize,
+                        (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                        row,
                     )
                 };
-                for px in row.as_chunks::<4>().0 {
-                    rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                for (o, p) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src.as_chunks::<4>().0)
+                {
+                    *o = [p[2], p[1], p[0], 255];
                 }
             }
-            unsafe { context.Unmap(&staging, 0) };
+            unsafe { self.context.Unmap(staging, 0) };
             Frame::from_raw(w, h, rgba)
                 .ok_or_else(|| CaptureError::Os("frame buffer size mismatch".into()))
-        })();
-        let _ = frame.Close();
-        let _ = session.Close();
-        let _ = pool.Close();
-        result
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = self.session.Close();
+            let _ = self.pool.Close();
+        }
     }
 }
 
@@ -233,7 +469,23 @@ mod imp {
 mod imp {
     use super::{CaptureError, Frame};
 
-    pub fn capture_game() -> Result<Frame, CaptureError> {
-        Err(CaptureError::Unsupported)
+    pub struct Session;
+
+    impl Session {
+        pub fn open(_exe: &str) -> Result<Self, CaptureError> {
+            Err(CaptureError::Unsupported)
+        }
+
+        pub fn size(&self) -> (u32, u32) {
+            (0, 0)
+        }
+
+        pub fn newest(&mut self) -> Result<(u32, u32), CaptureError> {
+            Err(CaptureError::Unsupported)
+        }
+
+        pub fn copy(&mut self, _x: u32, _y: u32, _w: u32, _h: u32) -> Result<Frame, CaptureError> {
+            Err(CaptureError::Unsupported)
+        }
     }
 }

@@ -22,7 +22,7 @@
 //! Pure: no capture, no IO, no platform code.
 
 mod gray;
-mod ncc;
+pub mod ncc;
 
 use std::collections::{BTreeMap, HashMap};
 

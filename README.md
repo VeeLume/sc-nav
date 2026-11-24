@@ -15,13 +15,13 @@ game's own local telemetry stream (when started with
 | Crate | What it is |
 |---|---|
 | `sc-nav-glyph` | Generic glyph matcher: read a line of game text from an ink image against templates, with ranked candidates per position. Pure. |
-| `sc-nav-vision` | Image tools for HUD panels: ink and shadow feature images, rotation, resampled bands, NCC over a whole image (FFT), peaks. Pure. |
+| `sc-nav-vision` | Image tools for HUD panels: ink and shadow feature images, rotation (of a frame or a rectangle), resampled bands, NCC over a whole image (FFT, prepared templates) or at a range of positions (direct), peaks. Pure. |
 | `sc-nav-font` | The game's HUD fonts from its own `fonts_en.gfx`, rendered to glyph templates. Pure; the fonts come from the install. |
 | `sc-nav-geo` | Pure maths: body frames, lat/long, SCAR (planet-local), surface and space guidance, the ground warning, and `Location` (a surface or a space point, one shareable code for both). |
 | `sc-nav-clock` | A corrected wall clock (SNTP), so nothing trusts the PC clock. |
 | `sc-nav-overlay` | Reads `r_DisplayInfo` from pixels: positions under a checksum, the view direction, the location name. No capture. |
 | `sc-nav-data` | Bodies, ships' braking and the overlay font from the installed game, cached per build. |
-| `sc-nav-capture` | Windows: the game window as a frame; with the default `overlay` feature, the overlay region of the screen (with recording) and `/showlocation` from the clipboard. |
+| `sc-nav-capture` | Windows: the game window as a frame, one shot or a kept session handing out the newest frame or a rectangle of it; with the default `overlay` feature, the overlay region of the screen (with recording) and `/showlocation` from the clipboard. |
 | `sc-nav-pilot` | The convenient layer: everything above fused into one state with a plain snapshot (position, steering, braking cue, PULL UP). Live feeds, recording and replay behind the `runtime` feature. |
 | `sc-nav-hud` | The egui app: a click-through HUD and a control window. |
 

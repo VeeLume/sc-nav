@@ -49,36 +49,52 @@ impl Gray {
         self.map(|x| ((x - lo) / (hi - lo)).clamp(0.0, 1.0))
     }
 
-    fn filter(&self, k: usize, take: fn(f32, f32) -> f32) -> Self {
-        let r = k as isize / 2;
-        let (w, h) = (self.w as isize, self.h as isize);
-        let mut tmp = vec![0.0; self.v.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let mut m = self.v[(y * w + x) as usize];
-                for d in -r..=r {
-                    let xx = (x + d).clamp(0, w - 1);
-                    m = take(m, self.v[(y * w + xx) as usize]);
+    /// `take` (max or min) over a k x k square, edges clamped: a pass along
+    /// the rows, then one down the columns. Both run on whole slices so
+    /// they vectorise; max and min are exact in any order, so this is the
+    /// pixel-by-pixel filter's result.
+    fn filter(&self, k: usize, take: impl Fn(f32, f32) -> f32 + Copy) -> Self {
+        let r = k / 2;
+        let (w, h) = (self.w, self.h);
+        if w == 0 || h == 0 {
+            return self.clone();
+        }
+        let mut tmp = self.v.clone();
+        for (src, dst) in self.v.chunks_exact(w).zip(tmp.chunks_exact_mut(w)) {
+            // edges, where the window is clamped
+            let edge = |x: usize| {
+                let mut m = src[x];
+                for &v in &src[x.saturating_sub(r)..=(x + r).min(w - 1)] {
+                    m = take(m, v);
                 }
-                tmp[(y * w + x) as usize] = m;
+                m
+            };
+            if w <= 2 * r {
+                for (x, d) in dst.iter_mut().enumerate() {
+                    *d = edge(x);
+                }
+                continue;
+            }
+            for x in (0..r).chain(w - r..w) {
+                dst[x] = edge(x);
+            }
+            let inner = &mut dst[r..w - r];
+            for d in 0..=2 * r {
+                for (m, &v) in inner.iter_mut().zip(&src[d..w - 2 * r + d]) {
+                    *m = take(*m, v);
+                }
             }
         }
-        let mut out = vec![0.0; self.v.len()];
+        let mut out = tmp.clone();
         for y in 0..h {
-            for x in 0..w {
-                let mut m = tmp[(y * w + x) as usize];
-                for d in -r..=r {
-                    let yy = (y + d).clamp(0, h - 1);
-                    m = take(m, tmp[(yy * w + x) as usize]);
+            let row = &mut out[y * w..(y + 1) * w];
+            for yy in y.saturating_sub(r)..=(y + r).min(h - 1) {
+                for (m, &v) in row.iter_mut().zip(&tmp[yy * w..(yy + 1) * w]) {
+                    *m = take(*m, v);
                 }
-                out[(y * w + x) as usize] = m;
             }
         }
-        Self {
-            w: self.w,
-            h: self.h,
-            v: out,
-        }
+        Self { w, h, v: out }
     }
 
     /// Grey dilation (max) over a k x k square.
@@ -258,5 +274,56 @@ mod tests {
         let img = Gray::new(40, 20).map(|_| 0.5);
         let r = img.resized(0.37);
         assert!(r.v.iter().all(|&v| (v - 0.5).abs() < 1e-5));
+    }
+
+    /// The filter as it was, pixel by pixel with clamped indices.
+    fn filter_ref(g: &Gray, k: usize, take: fn(f32, f32) -> f32) -> Vec<f32> {
+        let r = k as isize / 2;
+        let (w, h) = (g.w as isize, g.h as isize);
+        let mut tmp = vec![0.0; g.v.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let mut m = g.v[(y * w + x) as usize];
+                for d in -r..=r {
+                    m = take(m, g.v[(y * w + (x + d).clamp(0, w - 1)) as usize]);
+                }
+                tmp[(y * w + x) as usize] = m;
+            }
+        }
+        let mut out = vec![0.0; g.v.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let mut m = tmp[(y * w + x) as usize];
+                for d in -r..=r {
+                    m = take(m, tmp[((y + d).clamp(0, h - 1) * w + x) as usize]);
+                }
+                out[(y * w + x) as usize] = m;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn filters_match_the_pixel_by_pixel_ones() {
+        let mut seed = 7u32;
+        for (w, h) in [(1, 1), (3, 2), (4, 9), (5, 5), (6, 3), (37, 23)] {
+            let mut g = Gray::new(w, h);
+            for v in &mut g.v {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = (seed >> 16) as f32;
+            }
+            for k in [1, 3, 5, 7] {
+                assert_eq!(
+                    g.max_filter(k).v,
+                    filter_ref(&g, k, f32::max),
+                    "{w}x{h} k{k}"
+                );
+                assert_eq!(
+                    g.min_filter(k).v,
+                    filter_ref(&g, k, f32::min),
+                    "{w}x{h} k{k}"
+                );
+            }
+        }
     }
 }
