@@ -69,7 +69,17 @@ fn main() {
         for (g, img) in &imgs {
             let t = Instant::now();
             let (line, _) = reader.read(img, &bodies, g.n, Instant::now(), g.unix_ms);
-            times.push(t.elapsed());
+            let took = t.elapsed();
+            times.push(took);
+            if took > Duration::from_millis(500) {
+                eprintln!(
+                    "slow: {} grab {}: {:.0} ms, {}",
+                    dir.file_name().unwrap().to_string_lossy(),
+                    g.n,
+                    took.as_secs_f64() * 1e3,
+                    line.outcome
+                );
+            }
             accepted += usize::from(line.outcome == "accepted");
             writeln!(log, "{}", serde_json::to_string(&line).unwrap()).unwrap();
         }

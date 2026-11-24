@@ -168,3 +168,21 @@ Each tilt also rotates the frame (~70 ms) and recomputes its features
   scale) gain nothing. What is left on Starlume's side: preparing its
   templates once per session (the frame size is fixed), and running the
   four tilts at once instead of after each other.
+
+## Overlay checksum search outliers (2026-11-24)
+
+Four of the 3,246 recorded grabs took over half a second, and none of them
+was read: 9.5 s, 9.1 s and 1.8 s with no solution, and 1.5 s ambiguous.
+In all four the checksum's beam search ran up to its cap of 300,000
+states, 52 to 61 times, on 44 to 70 uncertain digits.
+
+- Exact: each state kept a copy of every pick so far (up to 70 bytes), and
+  trimming the beam allocated a vector per state (about 18 million
+  allocations on the worst grab). Now each step keeps a (parent, pick) per
+  state, in the same order, and the best state's picks are traced back at
+  the end. Reads byte-identical; the worst grab 9.5 → 1.35 s.
+- The cap: 300,000 → 50,000 states. Reads are byte-identical on all
+  3,246 grabs at 100,000, 50,000 and 30,000 alike; the slowest grab then
+  takes 549, 451 and 167 ms. The beam keeps the cheapest states, and a
+  verified fit costs 0 or close, so a real fit survives the trim.
+- The overlay bench lists every grab over 500 ms (`slow:` on stderr).

@@ -258,7 +258,10 @@ pub struct Tuning {
     pub top_k: usize,
     /// |residual| that counts as fitting, metres.
     pub tolerance: f64,
-    /// States kept by the beam.
+    /// States kept by the beam. The cheapest are kept, so a verified fit
+    /// (cost 0 or close) survives; the cap bounds the time a frame of
+    /// unclear digits can take (300,000 states took 9 s, 50,000 take under
+    /// 0.5 s, with the same reads on every recorded grab).
     pub beam: usize,
     /// Another fit within this much cost, more than a metre away, makes the
     /// frame ambiguous.
@@ -278,7 +281,7 @@ impl Default for Tuning {
             alt: 0.25,
             top_k: 4,
             tolerance: 0.0015,
-            beam: 300_000,
+            beam: 50_000,
             ambiguous: 0.15,
             max_cost: 0.35,
         }
@@ -1099,13 +1102,17 @@ impl Matcher {
         let cheapest = |c: &Choice| c.2.iter().map(|a| a.0).fold(f32::MAX, f32::min);
         choices.sort_by(|a, b| cheapest(a).total_cmp(&cheapest(b)));
 
-        // states, flat: values (nv each), cost, picks (nc each, 0 = as read)
+        // States, flat: values (nv each) and cost. Which alternative each
+        // state took is kept per choice as (parent state, pick; 0 = as read),
+        // so a state costs its values, not a copy of every pick so far.
         let nc = choices.len();
         let mut vals: Vec<f64> = nums.iter().map(Number::top).collect();
         let mut cost: Vec<f32> = vec![0.0];
-        let mut picks: Vec<u8> = vec![0; nc];
-        for (ci, (var, _, alts)) in choices.iter().enumerate() {
+        let mut trail: Vec<(Vec<u32>, Vec<u8>)> = Vec::with_capacity(nc);
+        for (var, _, alts) in &choices {
             let n0 = cost.len();
+            let mut parent: Vec<u32> = (0..n0 as u32).collect();
+            let mut pick: Vec<u8> = vec![0; n0];
             for (a, &(extra, delta, _)) in alts.iter().enumerate() {
                 for s in 0..n0 {
                     if cost[s] + extra > t.max_cost {
@@ -1115,25 +1122,24 @@ impl Matcher {
                     vals.extend_from_within(s * nv..(s + 1) * nv);
                     vals[at + var] += delta;
                     cost.push(cost[s] + extra);
-                    let at = picks.len();
-                    picks.extend_from_within(s * nc..(s + 1) * nc);
-                    picks[at + ci] = a as u8 + 1;
+                    parent.push(s as u32);
+                    pick.push(a as u8 + 1);
                 }
             }
             if cost.len() > t.beam {
                 let mut idx: Vec<usize> = (0..cost.len()).collect();
                 idx.select_nth_unstable_by(t.beam, |&a, &b| cost[a].total_cmp(&cost[b]));
                 idx.truncate(t.beam);
-                vals = idx
-                    .iter()
-                    .flat_map(|&i| vals[i * nv..(i + 1) * nv].to_vec())
-                    .collect();
-                picks = idx
-                    .iter()
-                    .flat_map(|&i| picks[i * nc..(i + 1) * nc].to_vec())
-                    .collect();
+                let mut kept = Vec::with_capacity(idx.len() * nv);
+                for &i in &idx {
+                    kept.extend_from_slice(&vals[i * nv..(i + 1) * nv]);
+                }
+                vals = kept;
                 cost = idx.iter().map(|&i| cost[i]).collect();
+                parent = idx.iter().map(|&i| parent[i]).collect();
+                pick = idx.iter().map(|&i| pick[i]).collect();
             }
+            trail.push((parent, pick));
         }
 
         let state = |i: usize| &vals[i * nv..(i + 1) * nv];
@@ -1151,9 +1157,16 @@ impl Matcher {
                 return Search::Ambiguous;
             }
         }
+        // the best state's picks, back along its parents
+        let mut picks = vec![0u8; nc];
+        let mut at = best;
+        for (ci, (parent, pick)) in trail.iter().enumerate().rev() {
+            picks[ci] = pick[at];
+            at = parent[at] as usize;
+        }
         let mut chosen: HashMap<(usize, usize), char> = HashMap::new();
         for (ci, (var, k, alts)) in choices.iter().enumerate() {
-            let p = picks[best * nc + ci];
+            let p = picks[ci];
             if p > 0 {
                 chosen.insert((*var, *k), alts[p as usize - 1].2);
             }
