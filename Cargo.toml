@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "crates/glyph",
+    "crates/vision",
+    "crates/font",
     "crates/geo",
     "crates/clock",
     "crates/overlay",
@@ -20,6 +22,8 @@ repository = "https://github.com/VeeLume/sc-nav"
 
 [workspace.dependencies]
 sc-nav-glyph = { path = "crates/glyph", version = "0.1.0" }
+sc-nav-vision = { path = "crates/vision", version = "0.1.0" }
+sc-nav-font = { path = "crates/font", version = "0.1.0" }
 sc-nav-geo = { path = "crates/geo", version = "0.1.0" }
 sc-nav-clock = { path = "crates/clock", version = "0.1.0" }
 sc-nav-overlay = { path = "crates/overlay", version = "0.1.0" }

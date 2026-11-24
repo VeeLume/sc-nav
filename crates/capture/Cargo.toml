@@ -1,24 +1,59 @@
 [package]
 name = "sc-nav-capture"
-description = "Windows capture for sc-nav: the overlay region of the screen (with recording) and /showlocation from the clipboard"
+description = "Windows capture for sc-nav: the game window as a frame (Windows Graphics Capture); with `overlay`, the overlay region of the screen with recording and /showlocation from the clipboard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["overlay"]
+# sc-nav's own feeds: the r_DisplayInfo watch loop (screen capture, reader,
+# recording), recorded grabs, /showlocation from the clipboard. Off, only
+# the window capture is left (what Starlume uses).
+overlay = [
+    "dep:sc-nav-geo",
+    "dep:sc-nav-overlay",
+    "dep:sc-nav-clock",
+    "dep:anyhow",
+    "dep:serde_json",
+    "dep:xcap",
+    "dep:windows-sys",
+    "image/png",
+]
+
 [dependencies]
-sc-nav-geo = { workspace = true }
-sc-nav-overlay = { workspace = true }
-sc-nav-clock = { workspace = true }
-anyhow = { workspace = true }
-serde_json = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png"] }
-xcap = "0.7"
+image = { version = "0.25", default-features = false }
+sc-nav-geo = { workspace = true, optional = true }
+sc-nav-overlay = { workspace = true, optional = true }
+sc-nav-clock = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+xcap = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61", optional = true, features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
 ] }
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[example]]
+name = "bench"
+required-features = ["overlay"]
