@@ -304,3 +304,97 @@ the HUD to repaint only when a setting the HUD shows changes. The pilot's
 changes and the loader repaint only the HUD. The HUD process in the demo:
 about 4.5–5% → 3.2% of one core. The HUD still repaints on every
 telemetry frame.
+
+## Hot loop audit (2026-11-25)
+
+Temporary timers in a copy of the tree (glyph phases, overlay phases, number
+reads by format), overlay bench over all 3,246 grabs. Before, per grab: 32.7
+number reads, 21.7 of them reaching the glyph matcher; placement 13.3 ms,
+naming 8.8, hits 6.2, band backgrounds 4.0; the `Root` search 14.3 ms of
+the read even with its row hint.
+
+Three changes, reads byte-identical on all 3,246 grabs:
+
+- **Placement takes one hit per ink.** A grab's placements took 14,784
+  hits in total; 5,844 have their own ink (x, w) among the hits the same
+  slots take. The others are the other phases and similar glyphs peaking at
+  the same spot. They have the same predecessors and successors as the best
+  one, so they can't be on the best string, and placement cost goes with
+  hits × neighbours. `glyph::distinct` drops them before the program runs:
+  placement 9.5 → 2.8 ms a grab (same binary, on and off). Hits no wider
+  than `overlap` are kept. Two of those at the same x can follow each
+  other, and the reader's wrong-format parses do use that: without the
+  exception, 2 reads changed (a `Root` z of 2452.13 m had been accepted
+  through its km parse as 2452.1).
+- **`Zone` formats read when needed.** `three_any` read each of the three
+  tokens as km and as metres, then tried the combinations. A metre read of
+  a km token does not fail; it gives a wrong number that the checks then
+  reject, at the full cost of a read. Now combinations come in the same
+  order and a token is read in a format only when a combination needs it:
+  three reads for a line that fits as km, two for a line whose first token
+  is no number. Metre-format reads 7.7 → 3.8 a grab, the `Root` search
+  14.7 → 7.6 ms.
+- **Band backgrounds by counting.** The 35th percentile per 8 px block was
+  a fresh vector and a selection over 8 x 48 px, 96 blocks a line, ~25
+  lines. The windows overlap and the pixels are k/255, so a 256-bin count
+  that follows the window gives the same value. An image that isn't on
+  that grid takes the selection as before. 4.0 → 1.45 ms a grab.
+
+Wall time, all 3,246 grabs, HEAD (ae7cec2) then the working tree, one run
+each, another build running on the machine:
+
+| session | before mean / p90 | after mean / p90 |
+|---|---|---|
+| 1794434626 | 23.0 / 32.3 ms | 12.0 / 18.1 ms |
+| 1794440111 | 26.7 / 34.3 ms | 15.1 / 21.1 ms |
+| 1794442146 | 39.0 / 65.5 ms | 19.6 / 29.7 ms |
+| 1794444000 | 18.2 / 19.0 ms | 9.8 / 11.5 ms |
+| all | 31.9 / 50.3 ms | 16.3 / 25.2 ms |
+
+Left, per grab after the changes: naming ~5.5 ms (exemplar prep per `Line`
+~1 ms of it, see above), hits ~4, location names ~2.7, placement ~2.8,
+`luminance` 0.6 (two passes and an intermediate `Vec<u8>`), the band's
+normalisation ~1.4 (a modulo and a division per pixel). About one `Root`
+search in five has no usable row hint (the rows moved) and scans every
+line, ~2 ms a grab on average. Not measured, from reading:
+`vision::Correlator::transform` allocates a zeroed padded buffer per
+unprepared `ncc` and runs a row transform over every padded row though
+only the template's rows are non-zero; `Gray::filter` clones its buffer
+twice and each pass includes a sweep of a pixel with itself.
+
+### A kept capture handed out old frames
+
+`Session` only empties the capture's frame pool when it is asked for a
+frame. The pool holds two frames, and Windows drops every later one while
+it is full. Measured on a console window printing every 10 ms
+(`SystemRelativeTime` of each frame taken from the pool): a call one second
+after the previous one got the two frames from 17 and 33 ms after that
+previous call, so the frame read was ~960 ms old. A call 60 ms later got
+frames a full second newer. The watch loop stamps a fix with the time of
+the grab, so every overlay fix was about a second late (the loop's own
+interval), and Starlume's reads lagged by theirs.
+
+Now a call that finds the pool full empties it and waits for the next
+frame to arrive (measured 5–8 ms on that window; up to 100 ms, then the
+newest of the old ones, when the window has stopped changing). The same
+test: the frame read is the one from the moment of the call. This costs
+wall time in the reading thread, not CPU. Not yet checked against the
+game itself.
+
+## The clock's first sync as a step in time (2026-11-25)
+
+`record_and_replay_round_trip` failed on a PC whose clock is 27.5 s behind
+(all four servers: +27,494 ms). `Runtime::start` began the SNTP sync in the
+background, so the pilot's start and the first inputs were stamped with the
+PC clock, and ~0.2 s later every input was 27.5 s ahead. The recording had
+that gap in it, the replay waited it out (6.9 s at 4x; the test allows
+5 s), and the live pilot saw time jump by the offset.
+
+Now nothing is stamped before the first sync round is over:
+`sc_nav_clock::first_round(timeout)` starts the sync and waits for a round
+to finish, with an answer or without. `Runtime::start` calls it (up to
+2 s), and the HUD starts the clock at launch, so by the time the game data
+is loaded there is nothing to wait for. Offline, or with servers slower
+than the wait, times are the PC clock's as before, and a later round that
+gets through is still a step. The rounds every 5 minutes also still move
+the clock by what the offset changed (milliseconds).
