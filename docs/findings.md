@@ -398,3 +398,47 @@ is loaded there is nothing to wait for. Offline, or with servers slower
 than the wait, times are the PC clock's as before, and a later round that
 gets through is still a step. The rounds every 5 minutes also still move
 the clock by what the offset changed (milliseconds).
+
+## Allocations and repeated work in a read (2026-11-25)
+
+A counting allocator in the overlay bench (temporary, with per-phase
+timers, in a copy of the tree), all 3,246 grabs. Before, a read made
+24,077 allocations (14 MB): 10,766 in the exemplar windows (a `Vec` per
+window), 3,739 preparing the exemplars and 2,684 preparing the mean
+templates for every `Line`, ~2,000 cloning letter templates into a set per
+name token.
+
+What changed, reads byte-identical on all 3,246 grabs:
+
+- **Slot membership once.** Which slots take a hit was looked up in the
+  slots' strings three times per hit and placement (`usable`, `distinct`,
+  the placement's own table). Now once per distinct char, as a bit mask
+  that all three use: `usable` 0.50 → 0.24 ms, `distinct` 0.79 → 0.35 ms a
+  grab.
+- **Exemplar windows in one buffer** per size: 10,766 → 712 allocations,
+  1.03 → 0.65 ms.
+- **Sets prepared once.** `glyph::Prepared` holds a set's templates as the
+  matcher uses them (ink columns, unit vectors, exemplars grouped by char);
+  `Line::with` reads with it, `Line::with_chars` with only some chars'
+  templates (a name's letters, without cloning them into a set). The
+  overlay keeps one per set and prepares again when the set's counts change
+  (a learned exemplar). `Line::new` prepares per line as before. Measured
+  before the change: 0.38 ms a grab for the mean templates, 0.8 ms for the
+  exemplars.
+- **`band`** normalises row by row and block by block instead of a modulo
+  and a division per pixel: 1.13 → 0.85 ms. **`luminance`** in one pass,
+  without the intermediate `Vec<u8>`: 0.47 → 0.25 ms.
+
+The first two together: 24,077 → 13,953 allocations a grab, 15.9 → 14.5 ms
+(two binaries run in turn, twice). Everything, HEAD (a7ec283) against the
+working tree, run in turn twice on a busy machine: median 15.5 / 15.6 ms →
+12.7 / 12.6 ms, mean 16.3 / 17.9 → 13.3 / 13.6 ms.
+
+Left: the location name is read on every line's last token every grab
+(2.0–2.7 ms); a row hint as for `Root` would cut most of it but is not
+exact by construction. `tokens` runs up to four times per line (0.15 ms a
+grab in all). A read number is cloned into the frame's memo and per
+combination. The pilot's snapshot clones about eight strings and works out
+the SCAR code every frame, inside the 0.005 ms measured before. Starlume's
+digit reads still go through `glyph::read`, which prepares its set per
+band; `Prepared` is there for it.
