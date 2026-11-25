@@ -251,9 +251,18 @@ is searched as before.
   decimetres. With a row hint alone, without the label check, 59 reads
   differed, because reads teach exemplars and one changed read changes
   later frames too.
-- Wall time was measured with the game running (~10 cores busy). Old and
-  new alternated on session 1794442146: mean 92 → 75 ms and 102 → 51 ms.
-  On a quiet machine the first version (row hint only) measured 41 → 30 ms.
+- Wall time, game closed, all 3,246 grabs, two rounds (the second in
+  reverse order). Means per grab:
+
+  | commit | round 1 | round 2 | worst grab |
+  |---|---|---|---|
+  | ffdc116 (before the outlier, glyph and roles work) | 73.0 ms | 64.3 ms | 9.6 / 8.9 s |
+  | 60036a8 (outlier cap, glyph reads) | 54.9 ms | 57.1 ms | 0.72 / 0.31 s |
+  | 947b8ca (Root line roles) | 34.3 ms | 31.0 ms | 0.42 / 0.31 s |
+
+  Reads byte-identical across all three. Absolute times drift between
+  days on this machine (the glyph section's 52 → 41 ms was measured on
+  another run); the ratios hold.
 - The radius line and the location name still scan every line. The full
   scan's result (the lowest qualifying line, the best name over all lines)
   can only be kept exactly by reading the lines a hint would skip.
