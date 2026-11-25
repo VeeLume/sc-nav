@@ -442,3 +442,27 @@ combination. The pilot's snapshot clones about eight strings and works out
 the SCAR code every frame, inside the 0.005 ms measured before. Starlume's
 digit reads still go through `glyph::read`, which prepares its set per
 band; `Prepared` is there for it.
+
+## FFT: only the rows that hold data (2026-11-25)
+
+`Correlator::transform` copied the template into a fresh zeroed buffer of
+the padded size (3.7 MB for the half frame) and ran the row transform over
+every padded row, though a 60x10 template has ten rows that aren't zero. A
+zero row's spectrum is zero. Now the row pass takes each row from a
+closure into the per-thread row buffer and transforms only the rows that
+hold data; the image goes the same way, without its padded copy. Spectra
+are the same values (test: against every row transformed).
+
+`primitives` on a 2560x1440 screenshot, old and new binary in turn, three
+times, on a busy machine (single lines swing by 30% between runs, the vote
+is the steadier number):
+
+| step | before | after |
+|---|---|---|
+| simulated vote, whole frame, 4 threads | 529 / 501 / 539 ms | 472 / 459 / 479 ms |
+| `ncc`, 60x10 on the half window | 0.67 / 0.92 / 0.84 ms | 0.55 / 0.54 / 0.61 ms |
+
+About 10% of the vote, with no memory held. Starlume keeps its vote
+unprepared on purpose: prepared spectra for its whole bank at five scales
+would hold ~370 MB. What is left of an unprepared `ncc` beyond a prepared
+one is the template's column pass.
