@@ -19,11 +19,16 @@
 //! from verified reads), capturing and locating the region stay with the
 //! callers.
 //!
+//! A reader that reads many lines with one set prepares it once
+//! ([`Prepared`], [`Line::with`]): [`read`], [`place`] and [`Line::new`]
+//! prepare the set's templates again for every line.
+//!
 //! Pure: no capture, no IO, no platform code.
 
 mod gray;
 pub mod ncc;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 pub use gray::Gray;
@@ -158,50 +163,116 @@ pub fn ncc_at(img: &Gray, x: i64, y: i64, t: &Gray) -> f32 {
     (sit - si * st / n) / (vi * vt).sqrt()
 }
 
+/// One mean template ready to slide over a line.
+#[derive(Clone, Debug)]
+struct Glyph {
+    ch: char,
+    w: usize,
+    h: usize,
+    /// Its ink's left edge in the template, and the ink's width.
+    ink: (usize, usize),
+    /// Centred and scaled to unit norm; `None`: flat.
+    unit: Option<Vec<f32>>,
+}
+
+impl Glyph {
+    /// `None` for a template without ink.
+    fn new(ch: char, t: &Gray) -> Option<Self> {
+        let mut cols = (0..t.w).filter(|&x| (0..t.h).any(|y| t.get(x, y) > 0.5));
+        let il = cols.next()?;
+        let ir = cols.next_back().unwrap_or(il);
+        Some(Self {
+            ch,
+            w: t.w,
+            h: t.h,
+            ink: (il, ir - il + 1),
+            unit: ncc::unit(t),
+        })
+    }
+
+    /// Whether it can score anywhere on `line` (a template may sit a pixel
+    /// above or below the line's own top and bottom).
+    fn fits(w: usize, h: usize, line: &Gray) -> bool {
+        w <= line.w && h <= line.h + 2
+    }
+}
+
+/// `set`'s mean templates that fit `line`, prepared for this one line.
+fn fresh<'s>(set: &'s TemplateSet, line: &'s Gray) -> impl Iterator<Item = Cow<'s, Glyph>> {
+    set.glyphs
+        .iter()
+        .filter(|(_, t)| Glyph::fits(t.w, t.h, line))
+        .filter_map(|(ch, t)| Glyph::new(*ch, t).map(Cow::Owned))
+}
+
+/// A [`TemplateSet`] ready to read lines with: each mean template's ink
+/// columns and unit vector, the exemplars centred, scaled and grouped by
+/// char. [`Line::new`] works these out for every line it is given; a
+/// reader with many lines and one set prepares it once and reads with
+/// [`Line::with`]. A set that changed (a new exemplar) is prepared again.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    glyphs: Vec<Glyph>,
+    named: Named,
+}
+
+impl Prepared {
+    pub fn new(set: &TemplateSet) -> Self {
+        Self {
+            glyphs: set
+                .glyphs
+                .iter()
+                .filter_map(|(ch, t)| Glyph::new(*ch, t))
+                .collect(),
+            named: Named::new(set),
+        }
+    }
+}
+
 /// Every template's local score peaks along the line, by ink left edge.
 /// A template may sit a pixel above or below the line's own top/bottom.
 pub fn hits(line: &Gray, set: &TemplateSet, p: &Params) -> Vec<Hit> {
-    hits_with(line, &ncc::Stats::new(line), set, p)
+    hits_with(line, &ncc::Stats::new(line), fresh(set, line), p)
 }
 
-fn hits_with(line: &Gray, stats: &ncc::Stats, set: &TemplateSet, p: &Params) -> Vec<Hit> {
+fn hits_with<'g>(
+    line: &Gray,
+    stats: &ncc::Stats,
+    glyphs: impl Iterator<Item = Cow<'g, Glyph>>,
+    p: &Params,
+) -> Vec<Hit> {
     let mut out = Vec::new();
     let (mut scores, mut dots) = (Vec::new(), Vec::new());
     // Per template size: each window's √Σ(v − mean)², row by row (NaN:
     // flat), shared by every template of that size.
     let mut sds: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
-    for (ch, t) in &set.glyphs {
-        if t.w > line.w || t.h > line.h + 2 {
+    for g in glyphs {
+        let g = &*g;
+        if !Glyph::fits(g.w, g.h, line) {
             continue;
         }
-        let cols: Vec<usize> = (0..t.w)
-            .filter(|&x| (0..t.h).any(|y| t.get(x, y) > 0.5))
-            .collect();
-        let (Some(&il), Some(&ir)) = (cols.first(), cols.last()) else {
-            continue;
-        };
         // the best over the rows the template fits in; a row a pixel off
         // the line scores 0, so nothing scores below that
-        let nx = line.w - t.w + 1;
+        let nx = line.w - g.w + 1;
         scores.clear();
         scores.resize(nx, 0.0f32);
-        if t.h <= line.h
-            && let Some(u) = ncc::unit(t)
+        if g.h <= line.h
+            && let Some(u) = &g.unit
         {
             dots.resize(nx, 0.0f32);
-            let sd = sds.entry((t.w, t.h)).or_insert_with(|| {
-                let mut sd = Vec::with_capacity(nx * (line.h - t.h + 1));
-                for y in 0..=line.h - t.h {
+            let sd = sds.entry((g.w, g.h)).or_insert_with(|| {
+                let mut sd = Vec::with_capacity(nx * (line.h - g.h + 1));
+                for y in 0..=line.h - g.h {
                     sd.extend((0..nx).map(|x| {
                         stats
-                            .spread(x, y, t.w, t.h)
+                            .spread(x, y, g.w, g.h)
                             .map_or(f32::NAN, |var| var.sqrt() as f32)
                     }));
                 }
                 sd
             });
-            for (y, sd) in (0..=line.h - t.h).zip(sd.chunks_exact(nx)) {
-                ncc::row_dots(line, &u, t.w, t.h, y, &mut dots);
+            for (y, sd) in (0..=line.h - g.h).zip(sd.chunks_exact(nx)) {
+                ncc::row_dots(line, u, g.w, g.h, y, &mut dots);
                 for ((s, &d), &k) in scores.iter_mut().zip(&dots).zip(sd) {
                     if !k.is_nan() {
                         *s = s.max(d / k);
@@ -215,9 +286,9 @@ fn hits_with(line: &Gray, stats: &ncc::Stats, set: &TemplateSet, p: &Params) -> 
             let hi = (x + p.peak_radius + 1).min(scores.len());
             if v >= p.min_score && scores[lo..hi].iter().all(|&o| o <= v) {
                 out.push(Hit {
-                    x: x + il,
-                    w: ir - il + 1,
-                    ch: *ch,
+                    x: x + g.ink.0,
+                    w: g.ink.1,
+                    ch: g.ch,
                     score: v,
                 });
             }
@@ -233,12 +304,47 @@ pub fn place(line: &Gray, set: &TemplateSet, grammar: &Grammar, p: &Params) -> V
     Line::new(line, set, p).place(grammar)
 }
 
-fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)> {
+/// Per hit, the slots whose chars have its char, a bit each (the first
+/// [`MASKED`] slots): looked up in the slots' strings once per distinct
+/// char, not once per hit and use.
+fn membership(hits: &[Hit], slots: &[Slot]) -> Vec<u64> {
+    let mut seen: Vec<(char, u64)> = Vec::new();
+    hits.iter()
+        .map(|h| {
+            if let Some(&(_, m)) = seen.iter().find(|(c, _)| *c == h.ch) {
+                return m;
+            }
+            let m = slots
+                .iter()
+                .take(MASKED)
+                .enumerate()
+                .fold(0u64, |m, (si, s)| {
+                    m | (u64::from(s.chars.contains(h.ch)) << si)
+                });
+            seen.push((h.ch, m));
+            m
+        })
+        .collect()
+}
+
+/// Slots a [`membership`] mask covers; a grammar with more is placed
+/// without the shortcuts built on the masks.
+const MASKED: usize = 64;
+
+/// `masks`: [`membership`] of `cands` in the grammar's slots.
+fn place_hits(cands: &[Hit], masks: &[u64], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)> {
     let slots = &grammar.0;
     if slots.is_empty() || cands.is_empty() {
         return vec![];
     }
-    let cands = &distinct(cands, slots, p)[..];
+    // the slots that take a glyph at all
+    let live = slots
+        .iter()
+        .take(MASKED)
+        .enumerate()
+        .fold(0u64, |m, (si, s)| m | (u64::from(s.max > 0) << si));
+    let (cands, masks) = distinct(cands, masks, live, slots.len(), p);
+    let (cands, masks) = (&cands[..], &masks[..]);
     // State (hit i, slot si, count cnt in the slot) at i * stride + at[si] +
     // cnt - 1: the best total ending there and its back pointer.
     let mut at = Vec::with_capacity(slots.len());
@@ -262,10 +368,15 @@ fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)>
     // which slots take which hit
     let takes: Vec<bool> = cands
         .iter()
-        .flat_map(|c| {
-            slots
-                .iter()
-                .map(move |s| s.max > 0 && s.chars.contains(c.ch))
+        .zip(masks)
+        .flat_map(|(c, &m)| {
+            slots.iter().enumerate().map(move |(si, s)| {
+                if si < MASKED {
+                    (m & live) >> si & 1 == 1
+                } else {
+                    s.max > 0 && s.chars.contains(c.ch)
+                }
+            })
         })
         .collect();
     // a predecessor's ink ends at most `gap` before this one's starts, so it
@@ -368,48 +479,52 @@ fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)>
 /// every similar glyph peaks at the same spot. Hits no wider than `overlap`
 /// all stay, because those can follow each other at the same x.
 ///
-/// `cands` are sorted by x.
-fn distinct(cands: &[Hit], slots: &[Slot], p: &Params) -> Vec<Hit> {
-    if slots.len() > 64 {
-        return cands.to_vec();
+/// `cands` are sorted by x, `masks` their [`membership`], `live` the slots
+/// that take a glyph at all. Returns the hits kept and their masks.
+fn distinct(
+    cands: &[Hit],
+    masks: &[u64],
+    live: u64,
+    slots: usize,
+    p: &Params,
+) -> (Vec<Hit>, Vec<u64>) {
+    if slots > MASKED {
+        return (cands.to_vec(), masks.to_vec());
     }
-    // per hit: the slots that take it, a bit each
-    let masks: Vec<u64> = cands
-        .iter()
-        .map(|c| {
-            slots.iter().enumerate().fold(0u64, |m, (si, s)| {
-                m | (u64::from(s.max > 0 && s.chars.contains(c.ch)) << si)
-            })
-        })
-        .collect();
     let mut out = Vec::with_capacity(cands.len());
+    let mut out_masks = Vec::with_capacity(cands.len());
     let mut g0 = 0;
     while g0 < cands.len() {
         let x = cands[g0].x;
         let g1 = g0 + cands[g0..].iter().take_while(|c| c.x == x).count();
         for a in g0..g1 {
             let ca = &cands[a];
+            let ma = masks[a] & live;
             let beaten = ca.w > p.overlap
                 && (g0..g1).any(|b| {
                     let cb = &cands[b];
                     b != a
                         && cb.w == ca.w
-                        && masks[b] == masks[a]
+                        && masks[b] & live == ma
                         && (cb.score > ca.score || (cb.score == ca.score && b < a))
                 });
             if !beaten {
                 out.push(*ca);
+                out_masks.push(masks[a]);
             }
         }
         g0 = g1;
     }
-    out
+    (out, out_masks)
 }
 
 /// A set's exemplars ready to name glyphs: centred and scaled to unit norm
 /// (`None`: flat), and grouped by char.
+#[derive(Clone, Debug)]
 struct Named {
     units: Vec<Option<Vec<f32>>>,
+    /// Per exemplar, its width and height.
+    sizes: Vec<(usize, usize)>,
     /// The exemplars' chars, sorted, each once.
     chars: Vec<char>,
     /// Per exemplar, its char's index in `chars`.
@@ -423,6 +538,7 @@ impl Named {
         chars.dedup();
         Self {
             units: set.exemplars.iter().map(|(_, g)| ncc::unit(g)).collect(),
+            sizes: set.exemplars.iter().map(|(_, g)| (g.w, g.h)).collect(),
             class: set
                 .exemplars
                 .iter()
@@ -444,7 +560,6 @@ impl Named {
 fn name(
     line: &Gray,
     stats: &ncc::Stats,
-    set: &TemplateSet,
     named: &Named,
     (x, w): (usize, usize),
     allowed: &str,
@@ -453,9 +568,9 @@ fn name(
     let ok: Vec<bool> = named.chars.iter().map(|&c| allowed.contains(c)).collect();
     // per char: the best score (an entry once an exemplar was tried)
     let mut per: Vec<Option<f32>> = vec![None; named.chars.len()];
-    // the line's windows per exemplar size, normalised
-    let mut windows: HashMap<(usize, usize), Vec<Vec<f32>>> = HashMap::new();
-    for (((_, g), u), &c) in set.exemplars.iter().zip(&named.units).zip(&named.class) {
+    // the line's windows per exemplar size, normalised, one after another
+    let mut windows: HashMap<(usize, usize), Vec<f32>> = HashMap::new();
+    for ((&(gw, gh), u), &c) in named.sizes.iter().zip(&named.units).zip(&named.class) {
         if !ok[c] {
             continue;
         }
@@ -464,16 +579,20 @@ fn name(
         let mut b = if p.reach >= 0 { 0.0f32 } else { f32::MIN };
         if let Some(u) = u {
             let ws = windows
-                .entry((g.w, g.h))
-                .or_insert_with(|| exemplar_windows(line, stats, x, w, g.w, g.h, p.reach));
-            let (quads, rest) = ws.as_chunks::<4>();
-            for q in quads {
-                for d in ncc::dot4([&q[0], &q[1], &q[2], &q[3]], u) {
-                    b = b.max(d);
+                .entry((gw, gh))
+                .or_insert_with(|| exemplar_windows(line, stats, x, w, gw, gh, p.reach));
+            let n = gw * gh;
+            if n > 0 {
+                let mut quads = ws.chunks_exact(4 * n);
+                for q in &mut quads {
+                    let four = [&q[..n], &q[n..2 * n], &q[2 * n..3 * n], &q[3 * n..]];
+                    for d in ncc::dot4(four, u) {
+                        b = b.max(d);
+                    }
                 }
-            }
-            for win in rest {
-                b = b.max(ncc::dot(win, u));
+                for win in quads.remainder().chunks_exact(n) {
+                    b = b.max(ncc::dot(win, u));
+                }
             }
         }
         let e = per[c].get_or_insert(f32::MIN);
@@ -492,7 +611,8 @@ fn name(
 
 /// The line's `gw` x `gh` windows an exemplar is tried at, around the
 /// glyph whose ink starts at `x` (width `w`): centred, unit norm, the flat
-/// and the out-of-bounds ones left out.
+/// and the out-of-bounds ones left out. One buffer, `gw * gh` values a
+/// window.
 fn exemplar_windows(
     line: &Gray,
     stats: &ncc::Stats,
@@ -501,11 +621,13 @@ fn exemplar_windows(
     gw: usize,
     gh: usize,
     reach: i64,
-) -> Vec<Vec<f32>> {
+) -> Vec<f32> {
     // the exemplar window centres the glyph's ink in its cell
     let x0 = x as i64 - 1 - (gw as i64 - 2 - w as i64) / 2;
     let top = line.h as i64 - gh as i64;
-    let mut out = vec![];
+    // room for every window tried, in bounds or not
+    let tried = ((2 * reach + 1) * (top + 3)).max(0) as usize;
+    let mut out = Vec::with_capacity(tried * gw * gh);
     for dx in -reach..=reach {
         for y in -1..=top + 1 {
             let wx = x0 + dx;
@@ -517,12 +639,10 @@ fn exemplar_windows(
                 continue;
             };
             let (mean, k) = (stats.mean(wx, wy, gw, gh), var.sqrt());
-            let mut win = Vec::with_capacity(gw * gh);
             for ry in wy..wy + gh {
                 let row = &line.v[ry * line.w + wx..ry * line.w + wx + gw];
-                win.extend(row.iter().map(|&v| ((v as f64 - mean) / k) as f32));
+                out.extend(row.iter().map(|&v| ((v as f64 - mean) / k) as f32));
             }
-            out.push(win);
         }
     }
     out
@@ -545,25 +665,77 @@ pub fn read(
 /// and [`read`] with the same arguments.
 pub struct Line<'a> {
     line: &'a Gray,
-    set: &'a TemplateSet,
     p: Params,
     stats: ncc::Stats,
     hits: Vec<Hit>,
-    /// The exemplars ready to name glyphs, once one is needed.
-    named: std::cell::OnceCell<Named>,
+    exemplars: Exemplars<'a>,
+}
+
+/// The exemplars a line names its glyphs with.
+enum Exemplars<'a> {
+    /// A set's, made ready once a read needs one.
+    Later(&'a TemplateSet, std::cell::OnceCell<Named>),
+    Ready(&'a Named),
+}
+
+impl Exemplars<'_> {
+    /// `None` when there are no exemplars.
+    fn get(&self) -> Option<&Named> {
+        match self {
+            Exemplars::Later(set, cell) => {
+                (!set.exemplars.is_empty()).then(|| cell.get_or_init(|| Named::new(set)))
+            }
+            Exemplars::Ready(named) => (!named.units.is_empty()).then_some(*named),
+        }
+    }
 }
 
 impl<'a> Line<'a> {
+    /// The line read with `set`, whose templates are prepared here, for
+    /// this line. With many lines and one set, [`Line::with`].
     pub fn new(line: &'a Gray, set: &'a TemplateSet, p: &Params) -> Self {
         let stats = ncc::Stats::new(line);
-        let hits = hits_with(line, &stats, set, p);
+        let hits = hits_with(line, &stats, fresh(set, line), p);
         Self {
             line,
-            set,
             p: *p,
             stats,
             hits,
-            named: Default::default(),
+            exemplars: Exemplars::Later(set, Default::default()),
+        }
+    }
+
+    /// As [`Line::new`] with the set `prepared` was made from.
+    pub fn with(line: &'a Gray, prepared: &'a Prepared, p: &Params) -> Self {
+        Self::with_glyphs(line, prepared, |_| true, p)
+    }
+
+    /// As [`Line::with`], with only the mean templates of `chars`: for a
+    /// line known to hold nothing else (a word of a few letters, read with
+    /// a set of the whole alphabet).
+    pub fn with_chars(line: &'a Gray, prepared: &'a Prepared, chars: &str, p: &Params) -> Self {
+        Self::with_glyphs(line, prepared, |ch| chars.contains(ch), p)
+    }
+
+    fn with_glyphs(
+        line: &'a Gray,
+        prepared: &'a Prepared,
+        keep: impl Fn(char) -> bool,
+        p: &Params,
+    ) -> Self {
+        let stats = ncc::Stats::new(line);
+        let glyphs = prepared
+            .glyphs
+            .iter()
+            .filter(|g| keep(g.ch))
+            .map(Cow::Borrowed);
+        let hits = hits_with(line, &stats, glyphs, p);
+        Self {
+            line,
+            p: *p,
+            stats,
+            hits,
+            exemplars: Exemplars::Ready(&prepared.named),
         }
     }
 
@@ -572,45 +744,54 @@ impl<'a> Line<'a> {
         &self.hits
     }
 
-    /// The hits of chars the grammar has, in order: the others can't take
-    /// part in a placement.
-    fn usable(&self, grammar: &Grammar) -> Vec<Hit> {
-        self.hits
-            .iter()
-            .filter(|h| grammar.0.iter().any(|s| s.chars.contains(h.ch)))
-            .copied()
-            .collect()
+    /// The hits of chars the grammar has, in order (the others can't take
+    /// part in a placement), and their [`membership`].
+    fn usable(&self, grammar: &Grammar) -> (Vec<Hit>, Vec<u64>) {
+        let slots = &grammar.0;
+        if slots.len() > MASKED {
+            let hits: Vec<Hit> = self
+                .hits
+                .iter()
+                .filter(|h| slots.iter().any(|s| s.chars.contains(h.ch)))
+                .copied()
+                .collect();
+            let masks = membership(&hits, slots);
+            return (hits, masks);
+        }
+        let all = membership(&self.hits, slots);
+        let mut hits = Vec::with_capacity(self.hits.len());
+        let mut masks = Vec::with_capacity(self.hits.len());
+        for (h, m) in self.hits.iter().zip(all) {
+            if m != 0 {
+                hits.push(*h);
+                masks.push(m);
+            }
+        }
+        (hits, masks)
     }
 
     /// As [`place`].
     pub fn place(&self, grammar: &Grammar) -> Vec<(usize, Hit)> {
-        place_hits(&self.usable(grammar), grammar, &self.p)
+        let (cands, masks) = self.usable(grammar);
+        place_hits(&cands, &masks, grammar, &self.p)
     }
 
     /// As [`read`].
     pub fn read(&self, grammar: &Grammar) -> Option<Vec<Position>> {
-        let cands = self.usable(grammar);
-        let placed = place_hits(&cands, grammar, &self.p);
+        let (cands, masks) = self.usable(grammar);
+        let placed = place_hits(&cands, &masks, grammar, &self.p);
         if placed.is_empty() {
             return None;
         }
-        let set = self.set;
+        let named = self.exemplars.get();
         let out = placed
             .into_iter()
             .map(|(slot, h)| {
                 let allowed = &grammar.0[slot].chars;
-                let named =
-                    (!set.exemplars.is_empty()).then(|| self.named.get_or_init(|| Named::new(set)));
                 let mut ranked = match named {
-                    Some(named) if named.has(h.ch) => name(
-                        self.line,
-                        &self.stats,
-                        set,
-                        named,
-                        (h.x, h.w),
-                        allowed,
-                        &self.p,
-                    ),
+                    Some(named) if named.has(h.ch) => {
+                        name(self.line, &self.stats, named, (h.x, h.w), allowed, &self.p)
+                    }
                     _ => vec![],
                 };
                 if ranked.is_empty() {
@@ -768,11 +949,44 @@ mod tests {
             hit(9, 1, '1', 0.4), // no wider than the overlap: both stay
             hit(9, 1, '7', 0.5),
         ];
-        let kept: Vec<char> = distinct(&cands, &slots, &Params::default())
-            .iter()
-            .map(|h| h.ch)
-            .collect();
+        let masks = membership(&cands, &slots);
+        let (kept, _) = distinct(&cands, &masks, 0b11, slots.len(), &Params::default());
+        let kept: Vec<char> = kept.iter().map(|h| h.ch).collect();
         assert_eq!(kept, vec!['8', '1', '.', '1', '7']);
+    }
+
+    #[test]
+    fn a_prepared_set_reads_the_same() {
+        let mut s = set();
+        s.exemplars = font()
+            .into_iter()
+            .filter(|(c, _)| c.is_ascii_digit())
+            .collect();
+        let p = Params::default();
+        let prepared = Prepared::new(&s);
+        let g = Grammar(vec![
+            Slot::new("0178", 1, 3),
+            Slot::new(".", 1, 1),
+            Slot::new("0178", 1, 2),
+        ]);
+        for text in ["10.7", "8.08", "170.1", "17"] {
+            let l = line(text);
+            let (fresh, kept) = (Line::new(&l, &s, &p), Line::with(&l, &prepared, &p));
+            assert_eq!(fresh.hits(), kept.hits(), "{text}");
+            assert_eq!(fresh.read(&g), kept.read(&g), "{text}");
+            assert_eq!(fresh.place(&g), kept.place(&g), "{text}");
+        }
+        // only some chars' templates: the set without the others
+        let l = line("17");
+        let ones = TemplateSet {
+            glyphs: font().into_iter().filter(|(c, _)| "17".contains(*c)).collect(),
+            exemplars: vec![],
+        };
+        let plain = Prepared::new(&set());
+        assert_eq!(
+            Line::with_chars(&l, &plain, "17", &p).hits(),
+            Line::new(&l, &ones, &p).hits()
+        );
     }
 
     #[test]
