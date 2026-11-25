@@ -238,6 +238,7 @@ fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)>
     if slots.is_empty() || cands.is_empty() {
         return vec![];
     }
+    let cands = &distinct(cands, slots, p)[..];
     // State (hit i, slot si, count cnt in the slot) at i * stride + at[si] +
     // cnt - 1: the best total ending there and its back pointer.
     let mut at = Vec::with_capacity(slots.len());
@@ -356,6 +357,52 @@ fn place_hits(cands: &[Hit], grammar: &Grammar, p: &Params) -> Vec<(usize, Hit)>
         }
     }
     out.reverse();
+    out
+}
+
+/// The hits a placement can end up using, in order. Of the hits with the
+/// same ink (x, w) that the same slots take, only the best-scoring can be
+/// placed (the first of them on a tie): they have the same predecessors and
+/// successors, so a string through a weaker one is never the better one.
+/// The others are left out, and they are most of the hits: every phase of
+/// every similar glyph peaks at the same spot. Hits no wider than `overlap`
+/// all stay, because those can follow each other at the same x.
+///
+/// `cands` are sorted by x.
+fn distinct(cands: &[Hit], slots: &[Slot], p: &Params) -> Vec<Hit> {
+    if slots.len() > 64 {
+        return cands.to_vec();
+    }
+    // per hit: the slots that take it, a bit each
+    let masks: Vec<u64> = cands
+        .iter()
+        .map(|c| {
+            slots.iter().enumerate().fold(0u64, |m, (si, s)| {
+                m | (u64::from(s.max > 0 && s.chars.contains(c.ch)) << si)
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(cands.len());
+    let mut g0 = 0;
+    while g0 < cands.len() {
+        let x = cands[g0].x;
+        let g1 = g0 + cands[g0..].iter().take_while(|c| c.x == x).count();
+        for a in g0..g1 {
+            let ca = &cands[a];
+            let beaten = ca.w > p.overlap
+                && (g0..g1).any(|b| {
+                    let cb = &cands[b];
+                    b != a
+                        && cb.w == ca.w
+                        && masks[b] == masks[a]
+                        && (cb.score > ca.score || (cb.score == ca.score && b < a))
+                });
+            if !beaten {
+                out.push(*ca);
+            }
+        }
+        g0 = g1;
+    }
     out
 }
 
@@ -706,6 +753,26 @@ mod tests {
         assert_eq!(read[0].runner_up().map(|r| r.0), Some('0'));
         assert_eq!(read[1].ch(), '0');
         assert_eq!(read[1].runner_up().map(|r| r.0), Some('8'));
+    }
+
+    #[test]
+    fn only_the_best_of_the_same_ink_is_placed() {
+        let hit = |x, w, ch, score| Hit { x, w, ch, score };
+        let slots = [Slot::new("0178", 1, 3), Slot::new(".", 1, 1)];
+        let cands = [
+            hit(4, 5, '0', 0.6),
+            hit(4, 5, '8', 0.9),
+            hit(4, 5, '7', 0.9), // a tie: the first stays
+            hit(4, 6, '1', 0.3), // another width
+            hit(4, 5, '.', 0.2), // another slot
+            hit(9, 1, '1', 0.4), // no wider than the overlap: both stay
+            hit(9, 1, '7', 0.5),
+        ];
+        let kept: Vec<char> = distinct(&cands, &slots, &Params::default())
+            .iter()
+            .map(|h| h.ch)
+            .collect();
+        assert_eq!(kept, vec!['8', '1', '.', '1', '7']);
     }
 
     #[test]
