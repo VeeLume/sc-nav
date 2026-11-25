@@ -84,17 +84,22 @@ fn band(lum: &Gray, top: usize) -> Option<Gray> {
     // per-column background, from coarse blocks
     let block = 8;
     let blocks = lum.w.div_ceil(block);
-    let bgs: Vec<f32> = (0..blocks)
-        .map(|b| {
-            let c = b * block + block / 2;
-            let (a, z) = (c.saturating_sub(BG_REACH), (c + BG_REACH).min(lum.w));
-            let mut px: Vec<f32> = (top..top + INK_ROWS)
-                .flat_map(|y| lum.v[y * lum.w + a..y * lum.w + z].iter().copied())
-                .collect();
-            let k = px.len() * 35 / 100;
-            *px.select_nth_unstable_by(k, f32::total_cmp).1
-        })
-        .collect();
+    let span = |b: usize| {
+        let c = b * block + block / 2;
+        (c.saturating_sub(BG_REACH), (c + BG_REACH).min(lum.w))
+    };
+    let bgs: Vec<f32> = counted_backgrounds(lum, top, blocks, span).unwrap_or_else(|| {
+        (0..blocks)
+            .map(|b| {
+                let (a, z) = span(b);
+                let mut px: Vec<f32> = (top..top + INK_ROWS)
+                    .flat_map(|y| lum.v[y * lum.w + a..y * lum.w + z].iter().copied())
+                    .collect();
+                let k = px.len() * 35 / 100;
+                *px.select_nth_unstable_by(k, f32::total_cmp).1
+            })
+            .collect()
+    });
     let mut v = lum.v[y0 * lum.w..(y0 + BAND) * lum.w].to_vec();
     for (i, x) in v.iter_mut().enumerate() {
         let bg = bgs[(i % lum.w) / block];
@@ -106,6 +111,61 @@ fn band(lum: &Gray, top: usize) -> Option<Gray> {
         h: BAND,
         v,
     })
+}
+
+/// [`band`]'s backgrounds by counting: the 35th percentile of the ink rows
+/// over each block's columns (`span`, moving right block by block), from a
+/// 256-bin count that follows the span instead of a selection per block.
+/// The same values as the selection gives; `None` when a pixel isn't k/255
+/// (an image that didn't come from [`luminance`]) or the rows aren't in
+/// the image.
+fn counted_backgrounds(
+    lum: &Gray,
+    top: usize,
+    blocks: usize,
+    span: impl Fn(usize) -> (usize, usize),
+) -> Option<Vec<f32>> {
+    let w = lum.w;
+    if w == 0 {
+        return None;
+    }
+    let rows = lum.v.get(top * w..(top + INK_ROWS) * w)?;
+    let mut levels = Vec::with_capacity(rows.len());
+    for &v in rows {
+        let k = (v * 255.0).round();
+        if !(0.0..=255.0).contains(&k) || k / 255.0 != v {
+            return None;
+        }
+        levels.push(k as u8);
+    }
+    let mut count = [0u32; 256];
+    // the columns counted so far
+    let (mut a0, mut z0) = (0, 0);
+    let mut out = Vec::with_capacity(blocks);
+    for b in 0..blocks {
+        let (a, z) = span(b);
+        if a < a0 || z < z0 {
+            return None;
+        }
+        for row in levels.chunks_exact(w) {
+            for &l in &row[a0..a.min(z0)] {
+                count[l as usize] -= 1;
+            }
+            for &l in &row[z0.max(a)..z] {
+                count[l as usize] += 1;
+            }
+        }
+        (a0, z0) = (a, z);
+        // the k-th smallest: the first level with more than k at or below it
+        let k = INK_ROWS * (z - a) * 35 / 100;
+        let mut below = 0;
+        let level = count.iter().position(|&n| {
+            below += n as usize;
+            below > k
+        })?;
+        out.push(level as f32 / 255.0);
+    }
+    Some(out)
 }
 
 /// Ink column runs, neighbours a pixel apart merged into one glyph.
@@ -835,37 +895,43 @@ impl Matcher {
             .collect()
     }
 
-    /// The last three tokens of a `Zone` line, every way they can be read:
-    /// each value is km (`12895961.5177km`) or metres (`-1031.75m`, used
-    /// under ~10 km), and a metre value also parses as a (wrong) km one. The
-    /// caller's check picks the combination that fits.
-    fn three_any(&self, line: &Gray) -> Vec<Vec<Number>> {
+    /// The last three tokens of a `Zone` line, every way they can be read,
+    /// handed to `each` until it returns something: each value is km
+    /// (`12895961.5177km`) or metres (`-1031.75m`, used under ~10 km), and
+    /// a metre value also parses as a (wrong) km one, so `each`'s check
+    /// picks the combination that fits. Combinations come km first, the
+    /// last token changing fastest, and a token is read in a format only
+    /// when a combination needs it: a line that fits as all km costs three
+    /// reads, a line whose first token is no number two.
+    fn three_any<R>(
+        &self,
+        line: &Gray,
+        mut each: impl FnMut(Vec<Number>) -> Option<R>,
+    ) -> Option<R> {
         let t = tokens(line);
         if t.len() < 4 {
-            return vec![];
+            return None;
         }
-        let per: Vec<Vec<Number>> = t[t.len() - 3..]
-            .iter()
-            .map(|tok| {
-                [KM, M2]
-                    .iter()
-                    .filter_map(|f| self.number(line, tok, *f))
-                    .collect()
-            })
-            .collect();
-        let mut out = vec![vec![]];
-        for options in per {
-            let mut next = vec![];
-            for prefix in &out {
-                for o in &options {
-                    let mut v: Vec<Number> = prefix.clone();
-                    v.push(o.clone());
-                    next.push(v);
+        let t = &t[t.len() - 3..];
+        for f0 in [KM, M2] {
+            let Some(a) = self.number(line, &t[0], f0) else {
+                continue;
+            };
+            for f1 in [KM, M2] {
+                let Some(b) = self.number(line, &t[1], f1) else {
+                    continue;
+                };
+                for f2 in [KM, M2] {
+                    let Some(c) = self.number(line, &t[2], f2) else {
+                        continue;
+                    };
+                    if let Some(r) = each(vec![a.clone(), b.clone(), c]) {
+                        return Some(r);
+                    }
                 }
             }
-            out = next;
         }
-        out
+        None
     }
 
     /// Read one frame. `offset` corrupts the checksum (the honesty test).
@@ -999,7 +1065,7 @@ impl Matcher {
     /// with seat, foot and space, so the search doesn't count on them).
     fn camdir(&self, lines: &[Gray]) -> Option<[i32; 3]> {
         for line in lines {
-            if !self.three_any(line).is_empty() {
+            if self.three_any(line, |_| Some(())).is_some() {
                 return None;
             }
             let t = tokens(line);
@@ -1040,7 +1106,7 @@ impl Matcher {
         let ea: f64 = elev_alt.iter().map(Number::top).sum();
         let mut elev_alt = Some(elev_alt);
         for (k, line) in lines.iter().enumerate() {
-            for mut nums in self.three_any(line) {
+            let found = self.three_any(line, |mut nums| {
                 let top: Vec<f64> = nums.iter().map(Number::top).collect();
                 // only the body's own frame comes near; SolarSystem and Root are millions off
                 if ((top[0] * top[0] + top[1] * top[1] + top[2] * top[2]).sqrt()
@@ -1050,7 +1116,7 @@ impl Matcher {
                     .abs()
                     > 2000.0
                 {
-                    continue;
+                    return None;
                 }
                 nums.extend(elev_alt.take()?);
                 let fits = |v: &[f64]| {
@@ -1062,7 +1128,10 @@ impl Matcher {
                         .abs()
                         < 0.12
                 };
-                return Some((self.search(&nums, 0.1, fits), k));
+                Some(self.search(&nums, 0.1, fits))
+            });
+            if let Some(found) = found {
+                return Some((found, k));
             }
         }
         None
@@ -1080,7 +1149,7 @@ impl Matcher {
     ) -> Option<([f64; 3], Glyphs)> {
         let hyp = cam[0].hypot(cam[1]);
         let read = |line: &Gray| -> Option<([f64; 3], Glyphs)> {
-            for nums in self.three_any(line) {
+            self.three_any(line, |nums| {
                 let top: Vec<f64> = nums.iter().map(Number::top).collect();
                 for b in bodies {
                     // the search fixes a digit or two, not a different line
@@ -1102,8 +1171,8 @@ impl Matcher {
                         return Some(([vals[0], vals[1], vals[2]], glyphs));
                     }
                 }
-            }
-            None
+                None
+            })
         };
         // The line on the row it was on last, if its label has the same
         // shape, then every line, lowest first. (In Stanton the
