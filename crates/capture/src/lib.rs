@@ -2,8 +2,8 @@
 //! - [`window`]: the game window (Windows Graphics Capture): one frame on
 //!   demand ([`capture_game`]), or a [`Session`] kept open that hands out
 //!   the newest frame or a rectangle of it. Always there.
-//! - With the `overlay` feature (default): the overlay region of the
-//!   primary screen about once a second ([`watch`], with optional recording
+//! - With the `overlay` feature (default): the overlay corner of the game
+//!   window about once a second ([`watch`], with optional recording
 //!   of every grab), reading recorded grabs back ([`grab_log`],
 //!   [`grab_image`]), and `/showlocation` from the clipboard ([`clipboard`]).
 

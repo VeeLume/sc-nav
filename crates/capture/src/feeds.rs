@@ -1,5 +1,5 @@
-//! The overlay feeds: the screen region read about once a second, with
-//! recording, and recorded grabs read back.
+//! The overlay feeds: the game window's overlay corner read about once a
+//! second, with recording, and recorded grabs read back.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use image::{RgbaImage, imageops};
+use image::RgbaImage;
 use sc_nav_geo::Body;
 use sc_nav_overlay::stream::{Fix, GrabLog, Reader, region};
-use xcap::Monitor;
+
+use crate::window::{CaptureError, Session};
 
 struct Recorder {
     dir: PathBuf,
@@ -47,7 +48,17 @@ pub struct Settings {
     pub record: Option<PathBuf>,
 }
 
-/// Read the screen until `on_fix` breaks. `ttf` is `Engine\Fonts\VeraMono.ttf`.
+/// How long to wait before looking for the game window again.
+const RETRY: Duration = Duration::from_secs(5);
+
+/// Read the game's overlay until `on_fix` breaks. `ttf` is
+/// `Engine\Fonts\VeraMono.ttf`.
+///
+/// The game window is captured with a kept [`Session`] and only the overlay's
+/// corner ([`region`]) is copied off the GPU: under a millisecond a grab,
+/// where grabbing the whole screen took ~18 ms of CPU. Windows in front of
+/// the game (sc-nav's own HUD included) don't get in the way. Without the
+/// game (not running, minimised) the loop looks again every few seconds.
 pub fn watch(
     ttf: &[u8],
     bodies: &[Body],
@@ -55,29 +66,40 @@ pub fn watch(
     mut on_fix: impl FnMut(Fix) -> ControlFlow<()>,
 ) -> Result<()> {
     let mut reader = Reader::new(ttf).map_err(|e| anyhow!(e))?;
-    let monitors = Monitor::all()?;
-    let monitor = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .or(monitors.first())
-        .ok_or_else(|| anyhow!("no monitor"))?;
+    let mut session: Option<Session> = None;
+    let mut looked: Option<Instant> = None;
     let mut rec: Option<Recorder> = None;
     let mut n = 0;
     loop {
         let at = Instant::now();
         let set = settings();
         if !set.enabled {
+            // off: nothing captured, the session closed
+            session = None;
             std::thread::sleep(Duration::from_millis(250));
             continue;
         }
+        if session.is_none() && looked.is_none_or(|t| t.elapsed() >= RETRY) {
+            looked = Some(Instant::now());
+            session = Session::open().ok();
+        }
+        let Some(s) = session.as_mut() else {
+            std::thread::sleep(Duration::from_millis(250));
+            continue;
+        };
         if rec.as_ref().map(|r| &r.dir) != set.record.as_ref() {
             rec = set.record.as_deref().map(Recorder::new).transpose()?;
             n = 0;
         }
         let unix_ms = sc_nav_clock::now_ms();
-        let screen = monitor.capture_image()?;
-        let (x, y, w, h) = region(screen.width(), screen.height());
-        let crop = imageops::crop_imm(&screen, x, y, w, h).to_image();
+        let crop = match grab(s) {
+            Ok(c) => c,
+            Err(_) => {
+                // closed or minimised: look again later
+                session = None;
+                continue;
+            }
+        };
         let (log, fix) = reader.read(&crop, bodies, n, at, unix_ms);
         n += 1;
         if let Some(r) = rec.as_mut() {
@@ -90,6 +112,13 @@ pub fn watch(
         }
         std::thread::sleep(Duration::from_secs(1).saturating_sub(at.elapsed()));
     }
+}
+
+/// The overlay's corner of the newest frame.
+fn grab(s: &mut Session) -> Result<RgbaImage, CaptureError> {
+    let (w, h) = s.newest_size()?;
+    let (x, y, rw, rh) = region(w, h);
+    Ok(s.region(x, y, rw, rh)?.image)
 }
 
 /// A recorded session's `grabs.jsonl`, in order.

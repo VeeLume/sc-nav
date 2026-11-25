@@ -5,10 +5,10 @@ are from the game's debug overlay and its local telemetry, steer to marks on
 planets or in space, and get warned before you hit the ground.
 
 Nothing here touches the game process or its network traffic. It reads the
-screen (`r_DisplayInfo 1` or `2`), the clipboard (`/showlocation`), the
-game's own local telemetry stream (when started with
-`GRPC_CLIENT_SERVER_ENABLED=true`), and the game files (through
-[sc-holotable](https://github.com/VeeLume/sc-holotable)).
+game's window (`r_DisplayInfo 1` or `2`, through Windows' own window
+capture), the clipboard (`/showlocation`), the game's own local telemetry
+stream (when started with `GRPC_CLIENT_SERVER_ENABLED=true`), and the game
+files (through [sc-holotable](https://github.com/VeeLume/sc-holotable)).
 
 ## Crates
 
@@ -21,7 +21,7 @@ game's own local telemetry stream (when started with
 | `sc-nav-clock` | A corrected wall clock (SNTP), so nothing trusts the PC clock. |
 | `sc-nav-overlay` | Reads `r_DisplayInfo` from pixels: positions under a checksum, the view direction, the location name. No capture. |
 | `sc-nav-data` | Bodies, ships' braking and the overlay font from the installed game, cached per build. |
-| `sc-nav-capture` | Windows: the game window as a frame, one shot or a kept session handing out the newest frame or a rectangle of it; with the default `overlay` feature, the overlay region of the screen (with recording) and `/showlocation` from the clipboard. |
+| `sc-nav-capture` | Windows: the game window as a frame, one shot or a kept session handing out the newest frame or a rectangle of it; with the default `overlay` feature, the overlay corner of the game window (with recording) and `/showlocation` from the clipboard. |
 | `sc-nav-pilot` | The convenient layer: everything above fused into one state with a plain snapshot (position, steering, braking cue, PULL UP). Live feeds, recording and replay behind the `runtime` feature. |
 | `sc-nav-hud` | The egui app: a click-through HUD and a control window. |
 

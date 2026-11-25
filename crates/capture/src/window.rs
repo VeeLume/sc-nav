@@ -90,6 +90,12 @@ impl Session {
         self.0.size()
     }
 
+    /// The newest frame's size, to place a [`Session::region`] in. Waits
+    /// (up to two seconds) only when no frame has arrived yet.
+    pub fn newest_size(&mut self) -> Result<(u32, u32), CaptureError> {
+        self.0.newest()
+    }
+
     /// The newest frame, whole. Waits (up to two seconds) only when none has
     /// arrived since the session opened.
     pub fn frame(&mut self) -> Result<Frame, CaptureError> {

@@ -266,3 +266,28 @@ is searched as before.
 - The radius line and the location name still scan every line. The full
   scan's result (the lowest qualifying line, the best name over all lines)
   can only be kept exactly by reading the lines a hint would skip.
+
+## CPU while the game runs (2026-11-25)
+
+Star Citizen keeps about ten cores busy, so what runs beside it matters.
+Measured with the game closed (process CPU from `GetProcessTimes` /
+`TotalProcessorTime`):
+
+| part | CPU |
+|---|---|
+| overlay grab, whole screen through xcap + crop, once a second | 18 ms per grab (33 ms wall) |
+| overlay grab, kept `Session` + `region` of the corner | < 1 ms per grab; an idle open session 0 ms over 5 s |
+| overlay read | ~33 ms per grab (see above) |
+| HUD, demo telemetry at 15 Hz, redrawn on every update and at least every 250 ms | ~5% of one core, 85–112 MB |
+| game data load after a patch (sc-holotable) | ~130 s at ~1.15 cores, working set up to 5.8 GB, once per build |
+
+- The watch loop now captures the game window with a kept `Session` and
+  copies only the overlay corner off the GPU. xcap is gone from
+  sc-nav-capture. A window in front of the game, sc-nav's own HUD
+  included, no longer ends up in the grab. Without the game (not running,
+  minimised) the loop looks for its window every 5 s; turned off, it
+  closes the session.
+- Not yet verified in the game: the corner of a borderless game window is
+  the screen's corner. In windowed mode the window capture includes the
+  title bar, which moves the lines down by its height. The reader finds
+  lines wherever they are.

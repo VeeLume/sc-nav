@@ -3587,7 +3587,6 @@ dependencies = [
  "serde_json",
  "windows",
  "windows-sys 0.61.2",
- "xcap",
 ]
 
 [[package]]

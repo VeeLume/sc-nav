@@ -1,6 +1,6 @@
 [package]
 name = "sc-nav-capture"
-description = "Windows capture for sc-nav: the game window as a frame (Windows Graphics Capture); with `overlay`, the overlay region of the screen with recording and /showlocation from the clipboard"
+description = "Windows capture for sc-nav: the game window as a frame (Windows Graphics Capture); with `overlay`, the overlay corner of the game window read once a second (with recording) and /showlocation from the clipboard"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["overlay"]
-# sc-nav's own feeds: the r_DisplayInfo watch loop (screen capture, reader,
+# sc-nav's own feeds: the r_DisplayInfo watch loop (game window capture, reader,
 # recording), recorded grabs, /showlocation from the clipboard. Off, only
 # the window capture is left (what Starlume uses).
 overlay = [
@@ -18,7 +18,6 @@ overlay = [
     "dep:sc-nav-clock",
     "dep:anyhow",
     "dep:serde_json",
-    "dep:xcap",
     "dep:windows-sys",
     "image/png",
 ]
@@ -30,7 +29,6 @@ sc-nav-overlay = { workspace = true, optional = true }
 sc-nav-clock = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-xcap = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", optional = true, features = [
