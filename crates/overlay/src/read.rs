@@ -16,8 +16,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use sc_nav_glyph::{Grammar, Params, Position, Slot};
+use sc_nav_glyph::{Grammar, Params, Position, Prepared, Slot};
 pub use sc_nav_glyph::{Gray, TemplateSet};
 
 /// Rows read per line, from `MARGIN` above the line's top.
@@ -31,11 +32,18 @@ const DIGITS: &str = "0123456789";
 /// and the drop shadow go dark.
 pub fn luminance(img: &image::RgbaImage) -> Gray {
     let (w, h) = img.dimensions();
-    let px: Vec<u8> = img
-        .pixels()
-        .map(|p| p.0[0].min(p.0[1]).min(p.0[2]))
+    let v = img
+        .as_raw()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| p[0].min(p[1]).min(p[2]) as f32 / 255.0)
         .collect();
-    Gray::from_u8(w as usize, h as usize, &px)
+    Gray {
+        w: w as usize,
+        h: h as usize,
+        v,
+    }
 }
 
 /// The top row of each text line's digits, from ink-over-shadow contrast
@@ -101,10 +109,13 @@ fn band(lum: &Gray, top: usize) -> Option<Gray> {
             .collect()
     });
     let mut v = lum.v[y0 * lum.w..(y0 + BAND) * lum.w].to_vec();
-    for (i, x) in v.iter_mut().enumerate() {
-        let bg = bgs[(i % lum.w) / block];
-        let span = (1.0 - bg).max(30.0 / 255.0);
-        *x = ((*x - bg) / span).clamp(0.0, 1.0);
+    for row in v.chunks_exact_mut(lum.w.max(1)) {
+        for (cells, &bg) in row.chunks_mut(block).zip(&bgs) {
+            let span = (1.0 - bg).max(30.0 / 255.0);
+            for x in cells {
+                *x = ((*x - bg) / span).clamp(0.0, 1.0);
+            }
+        }
     }
     Some(Gray {
         w: lum.w,
@@ -488,17 +499,43 @@ pub struct Reading {
 
 /// The templates: rendered glyphs place, labelled exemplars name.
 pub struct Matcher {
+    /// Prepared for the glyph matcher once and again whenever its number of
+    /// templates or exemplars changes ([`Matcher::learn`] adds exemplars).
+    /// Changing a template in place needs [`Matcher::changed`].
     pub set: TemplateSet,
     pub tuning: Tuning,
     pub max_per_char: usize,
     /// Letters, digits and `_:` for reading names by dictionary; `None`:
-    /// names aren't read.
+    /// names aren't read. Only its mean templates are used; prepared as
+    /// `set` is.
     pub text: Option<TemplateSet>,
+    /// `set` and `text` as the glyph matcher reads with them.
+    prepared: RefCell<Kept>,
+    text_prepared: RefCell<Kept>,
     /// Numbers read in the current frame, by line, token and format: the
     /// `Zone`, `Root` and `CamDir` searches read the same lines.
     memo: RefCell<HashMap<NumberKey, Option<Number>>>,
     /// Where lines were found in earlier frames, tried first.
     roles: RefCell<Roles>,
+}
+
+/// A prepared set and the set's template and exemplar counts it was
+/// prepared at.
+type Kept = Option<(usize, usize, Arc<Prepared>)>;
+
+/// `set` prepared, from `kept` while the set has as many templates and
+/// exemplars as it had then.
+fn prepared(kept: &RefCell<Kept>, set: &TemplateSet) -> Arc<Prepared> {
+    let now = (set.glyphs.len(), set.exemplars.len());
+    let mut kept = kept.borrow_mut();
+    match &*kept {
+        Some((glyphs, exemplars, p)) if (*glyphs, *exemplars) == now => p.clone(),
+        _ => {
+            let p = Arc::new(Prepared::new(set));
+            *kept = Some((now.0, now.1, p.clone()));
+            p
+        }
+    }
 }
 
 /// The overlay's lines by what they are, learned from frames that read:
@@ -601,9 +638,18 @@ impl Matcher {
             tuning: Tuning::default(),
             max_per_char: 120,
             text: None,
+            prepared: RefCell::default(),
+            text_prepared: RefCell::default(),
             memo: RefCell::default(),
             roles: Default::default(),
         }
+    }
+
+    /// `set` or `text` was changed in a way their counts don't show (a
+    /// template replaced in place): prepare them again on the next read.
+    pub fn changed(&mut self) {
+        *self.prepared.get_mut() = None;
+        *self.text_prepared.get_mut() = None;
     }
 
     /// Also read names, with `font` rendered from [`TEXT_CHARS`].
@@ -627,7 +673,7 @@ impl Matcher {
         token: &[(usize, usize)],
         candidates: &[&str],
     ) -> Option<(usize, f32, f32)> {
-        let set = self.text.as_ref()?;
+        let text = self.text.as_ref()?;
         let (x0, x1) = (token.first()?.0, token.last()?.1);
         let ink = x1 - x0;
         let line = crop(cov, x0.saturating_sub(2), (x1 + 2).min(cov.w), 0, cov.h);
@@ -652,16 +698,23 @@ impl Matcher {
             .iter()
             .flat_map(|&(k, _)| candidates[k].chars())
             .collect();
-        let sub = TemplateSet {
-            glyphs: set
-                .glyphs
-                .iter()
-                .filter(|(c, _)| wanted.contains(*c))
-                .cloned()
-                .collect(),
-            exemplars: vec![],
+        // names are read with the mean templates alone
+        let set = {
+            let now = (text.glyphs.len(), 0);
+            let mut kept = self.text_prepared.borrow_mut();
+            match &*kept {
+                Some((glyphs, exemplars, p)) if (*glyphs, *exemplars) == now => p.clone(),
+                _ => {
+                    let p = Arc::new(Prepared::new(&TemplateSet {
+                        glyphs: text.glyphs.clone(),
+                        exemplars: vec![],
+                    }));
+                    *kept = Some((now.0, now.1, p.clone()));
+                    p
+                }
+            }
         };
-        let glyphs = sc_nav_glyph::Line::new(&line, &sub, &params);
+        let glyphs = sc_nav_glyph::Line::with_chars(&line, &set, &wanted, &params);
         let mut scores: Vec<(usize, f32)> = vec![];
         for &(k, n) in &fits {
             let grammar = Grammar(
@@ -838,7 +891,8 @@ impl Matcher {
                 ])
             }
         };
-        let glyphs = sc_nav_glyph::Line::new(&line, &self.set, &self.tuning.glyph);
+        let set = prepared(&self.prepared, &self.set);
+        let glyphs = sc_nav_glyph::Line::with(&line, &set, &self.tuning.glyph);
         let read: Vec<Position> = glyphs
             .read(&grammar(n, n))
             .or_else(|| glyphs.read(&grammar(1, 9)))?;
