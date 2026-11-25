@@ -11,7 +11,7 @@
 
 use std::io;
 use std::net::{ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,8 @@ pub struct Status {
 static OFFSET_US: AtomicI64 = AtomicI64::new(0);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static WAKE: AtomicBool = AtomicBool::new(false);
+/// Sync rounds finished, with an answer or without.
+static ROUNDS: AtomicU64 = AtomicU64::new(0);
 
 fn status_cell() -> &'static Mutex<Status> {
     static S: OnceLock<Mutex<Status>> = OnceLock::new();
@@ -98,6 +100,23 @@ pub fn start() {
     });
 }
 
+/// Start the background sync and wait until a round is over, at most
+/// `timeout`: whether the clock is corrected. Call it before the first
+/// [`now_ms`] that gets kept (a session's start, an input's time). Otherwise
+/// the offset arrives a moment later as a step in those times, as large as
+/// the PC clock is off. Returns at once when a round has already run.
+///
+/// `false` (offline, or the servers slower than `timeout`): times are the PC
+/// clock's, and step if a later round gets through.
+pub fn first_round(timeout: Duration) -> bool {
+    start();
+    let until = Instant::now() + timeout;
+    while ROUNDS.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    status().offset_ms.is_some()
+}
+
 /// Ask the background thread for a round now.
 pub fn sync_now() {
     WAKE.store(true, Ordering::SeqCst);
@@ -118,20 +137,22 @@ pub fn sync_round() -> Option<(String, Sample)> {
             Err(e) => errors.push(format!("{server}: {e}")),
         }
     }
-    let mut st = status_cell().lock().ok()?;
-    match &best {
-        Some((server, s)) => {
-            OFFSET_US.store((s.offset_ms * 1000.0).round() as i64, Ordering::Relaxed);
-            *st = Status {
-                offset_ms: Some(s.offset_ms),
-                rtt_ms: Some(s.rtt_ms),
-                server: Some(server.clone()),
-                synced_at: Some(Instant::now()),
-                error: None,
-            };
+    if let Ok(mut st) = status_cell().lock() {
+        match &best {
+            Some((server, s)) => {
+                OFFSET_US.store((s.offset_ms * 1000.0).round() as i64, Ordering::Relaxed);
+                *st = Status {
+                    offset_ms: Some(s.offset_ms),
+                    rtt_ms: Some(s.rtt_ms),
+                    server: Some(server.clone()),
+                    synced_at: Some(Instant::now()),
+                    error: None,
+                };
+            }
+            None => st.error = Some(errors.join("; ")),
         }
-        None => st.error = Some(errors.join("; ")),
     }
+    ROUNDS.fetch_add(1, Ordering::SeqCst);
     best
 }
 

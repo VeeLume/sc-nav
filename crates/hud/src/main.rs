@@ -114,6 +114,8 @@ fn main() -> Result<()> {
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
+            // synced by the time the game data is loaded
+            sc_nav_clock::start();
             let (tx, rx) = channel();
             let (ctx, cache) = (cc.egui_ctx.clone(), store.cache());
             std::thread::spawn(move || {
@@ -160,6 +162,8 @@ impl App {
         // the demo keeps its marks and phases in memory, away from the real ones
         let mut dir = Director::new(world.clone(), (!self.demo).then(|| store.marks()));
         dir.phases_path = (!self.demo).then(|| store.phases());
+        // the clock has been syncing since launch: normally no wait here
+        sc_nav_clock::first_round(sc_nav_pilot::runtime::CLOCK_WAIT);
         let ms = sc_nav_clock::now_ms();
         let mut pilot = Pilot::new(dir, ms);
         pilot.say(format!("{} · {} bodies · {} ships", world.build, world.bodies.len(), world.ships.len()));

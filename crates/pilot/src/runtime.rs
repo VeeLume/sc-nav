@@ -30,6 +30,11 @@ use serde::{Deserialize, Serialize};
 use crate::director::Director;
 use crate::pilot::{Cmd, Input, Link, OverlayFix, Pilot};
 
+/// How long [`Runtime::start`] waits for the clock's first sync round (a
+/// round takes ~0.2 s online). An app that starts the clock earlier
+/// (`sc_nav_clock::start`, while it loads) doesn't wait at all.
+pub const CLOCK_WAIT: Duration = Duration::from_secs(2);
+
 /// What the runtime needs besides the pilot.
 pub struct Config {
     /// Telemetry address, e.g. [`telemetry::DEFAULT_ADDR`].
@@ -291,13 +296,20 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Spawn the live feeds around `pilot` (unless `cfg.feeds` is off).
+    /// Spawn the live feeds around `pilot` (unless `cfg.feeds` is off),
+    /// once the clock's first sync round is over (up to [`CLOCK_WAIT`]).
+    /// Build `pilot` with a start time taken after
+    /// `sc_nav_clock::first_round` too.
     pub fn start(
         pilot: Pilot,
         cfg: Config,
         on_change: impl Fn() + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
-        sc_nav_clock::start();
+        // Nothing is stamped before the clock's first sync round is over:
+        // the offset arriving later would be a step in the inputs' times,
+        // as large as the PC clock is off (27.5 s on one machine: a gap in
+        // a recording, a jump for the pilot).
+        sc_nav_clock::first_round(CLOCK_WAIT);
         let rt = Self {
             pilot: Arc::new(Mutex::new(pilot)),
             ctl: Arc::new(Mutex::new(Control::default())),

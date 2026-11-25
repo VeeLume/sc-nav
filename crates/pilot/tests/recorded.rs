@@ -131,6 +131,10 @@ fn record_and_replay_round_trip() {
         ships: Default::default(),
         systems: vec![],
     };
+    // The clock's first sync before the pilot's start is stamped, as an app
+    // does: on a PC whose clock is off, the offset arriving later is a step
+    // in the timestamps, which the replay then waits out.
+    sc_nav_clock::first_round(sc_nav_pilot::runtime::CLOCK_WAIT);
     let start = sc_nav_clock::now_ms();
     let pilot = Pilot::new(Director::new(world.clone(), None), start);
     let cfg = Config {
