@@ -291,3 +291,16 @@ Measured with the game closed (process CPU from `GetProcessTimes` /
   the screen's corner. In windowed mode the window capture includes the
   title bar, which moves the lines down by its height. The reader finds
   lines wherever they are.
+
+### The control window (2026-11-25)
+
+Timers in the HUD (demo, telemetry at 15 Hz) showed 34 frames a second.
+Building the HUD took 0.03–0.05 ms a frame and the pilot's tick and
+snapshot 0.005 ms, but the control window took 2.1 ms a frame. It was an
+immediate viewport, so every HUD frame rebuilt and presented it as well,
+and its own repaints repainted the HUD. It is now a deferred viewport: it
+repaints on its own input and every 250 ms for its live values, and asks
+the HUD to repaint only when a setting the HUD shows changes. The pilot's
+changes and the loader repaint only the HUD. The HUD process in the demo:
+about 4.5–5% → 3.2% of one core. The HUD still repaints on every
+telemetry frame.

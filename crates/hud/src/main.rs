@@ -24,6 +24,7 @@ mod store;
 mod theme;
 
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -43,14 +44,37 @@ enum Phase {
 
 struct App {
     phase: Phase,
-    store: Store,
-    prefs: Prefs,
-    control: control::Control,
+    /// What the control window works on, shared with its own render pass.
+    shared: Arc<Mutex<Shared>>,
     control_pos: [f32; 2],
     demo: bool,
     layered: bool,
     /// A screenshot painted under the HUD (previews only).
     backdrop: Option<egui::TextureHandle>,
+}
+
+/// The control window is a deferred viewport: it repaints on its own input
+/// and timer, not on every HUD frame (the HUD repaints on every telemetry
+/// frame; rebuilding the control window with it took ~2 ms a frame).
+struct Shared {
+    view: View,
+    store: Store,
+    prefs: Prefs,
+    control: control::Control,
+}
+
+/// What the control window shows.
+enum View {
+    Loading(Instant),
+    Running(Runtime),
+    Failed(String),
+}
+
+/// The control window's live values refresh this often without input.
+const CONTROL_REFRESH: Duration = Duration::from_millis(250);
+
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// `--backdrop <image>`: a screenshot as the HUD's background.
@@ -94,13 +118,17 @@ fn main() -> Result<()> {
             let (ctx, cache) = (cc.egui_ctx.clone(), store.cache());
             std::thread::spawn(move || {
                 let _ = tx.send(sc_nav_data::load(&cache));
-                ctx.request_repaint();
+                ctx.request_repaint_of(ViewportId::ROOT);
             });
+            let since = Instant::now();
             Ok(Box::new(App {
-                phase: Phase::Loading { rx, since: Instant::now() },
-                prefs: Prefs::load(&store.prefs()),
-                store,
-                control: control::Control::new(demo),
+                phase: Phase::Loading { rx, since },
+                shared: Arc::new(Mutex::new(Shared {
+                    view: View::Loading(since),
+                    prefs: Prefs::load(&store.prefs()),
+                    store,
+                    control: control::Control::new(demo),
+                })),
                 control_pos,
                 demo,
                 layered: false,
@@ -126,11 +154,12 @@ fn placement() -> Option<([f32; 4], [f32; 2])> {
 impl App {
     /// Loading finished: build the pilot and start the feeds.
     fn start(&self, ctx: &egui::Context, world: World, font: Vec<u8>) -> Result<Runtime> {
-        let phases = load_phases(&self.store.phases());
+        let store = lock(&self.shared).store.clone();
+        let phases = load_phases(&store.phases());
         let world = world.with_phases(&phases);
         // the demo keeps its marks and phases in memory, away from the real ones
-        let mut dir = Director::new(world.clone(), (!self.demo).then(|| self.store.marks()));
-        dir.phases_path = (!self.demo).then(|| self.store.phases());
+        let mut dir = Director::new(world.clone(), (!self.demo).then(|| store.marks()));
+        dir.phases_path = (!self.demo).then(|| store.phases());
         let ms = sc_nav_clock::now_ms();
         let mut pilot = Pilot::new(dir, ms);
         pilot.say(format!("{} · {} bodies · {} ships", world.build, world.bodies.len(), world.ships.len()));
@@ -138,18 +167,20 @@ impl App {
             addr: telemetry::DEFAULT_ADDR.to_string(),
             font,
             world,
-            sessions: self.store.sessions(),
+            sessions: store.sessions(),
             feeds: !self.demo,
         };
+        // a change repaints the HUD; the control window refreshes on its own
         let repaint = ctx.clone();
-        let rt = Runtime::start(pilot, cfg, move || repaint.request_repaint())?;
+        let rt = Runtime::start(pilot, cfg, move || repaint.request_repaint_of(ViewportId::ROOT))?;
         if self.demo {
             demo::run(rt.clone());
         }
         Ok(rt)
     }
 
-    fn control_window(&mut self, ctx: &egui::Context) {
+    /// Register the control window (each HUD pass; it renders on its own).
+    fn control_window(&self, ctx: &egui::Context) {
         let builder = ViewportBuilder::default()
             .with_title(if self.demo { "sc-nav (demo)" } else { "sc-nav" })
             .with_inner_size([440.0, 760.0])
@@ -157,16 +188,25 @@ impl App {
             .with_position(self.control_pos)
             .with_transparent(false)
             .with_mouse_passthrough(false);
-        ctx.show_viewport_immediate(ViewportId::from_hash_of("control"), builder, |ui, _| {
+        let shared = self.shared.clone();
+        ctx.show_viewport_deferred(ViewportId::from_hash_of("control"), builder, move |ui, _| {
             if ui.input(|i| i.viewport().close_requested()) {
                 ui.ctx().send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
             }
-            match &self.phase {
-                Phase::Running { rt } => {
+            let mut guard = lock(&shared);
+            let Shared { view, store, prefs, control } = &mut *guard;
+            match view {
+                View::Running(rt) => {
+                    let before = prefs.clone();
                     let snap = rt.pilot().snapshot();
-                    self.control.ui(ui, rt, &snap, &self.store, &mut self.prefs);
+                    control.ui(ui, rt, &snap, store, prefs);
+                    if *prefs != before {
+                        // a setting the HUD shows: repaint it now
+                        ui.ctx().request_repaint_of(ViewportId::ROOT);
+                    }
+                    ui.ctx().request_repaint_after(CONTROL_REFRESH);
                 }
-                Phase::Loading { since, .. } => {
+                View::Loading(since) => {
                     let secs = since.elapsed().as_secs();
                     egui::CentralPanel::default().show(ui, |ui| {
                         ui.add_space(ui.available_height() * 0.3);
@@ -184,7 +224,7 @@ impl App {
                     });
                     ui.ctx().request_repaint_after(Duration::from_millis(500));
                 }
-                Phase::Failed(e) => {
+                View::Failed(e) => {
                     let e = e.clone();
                     egui::CentralPanel::default().show(ui, |ui| {
                         ui.add_space(40.0);
@@ -211,16 +251,23 @@ impl eframe::App for App {
         }
         let ctx = ui.ctx().clone();
         if let Phase::Loading { rx, .. } = &self.phase {
-            match rx.try_recv() {
-                Ok(Ok((world, font))) => {
-                    self.phase = match self.start(&ctx, world, font) {
-                        Ok(rt) => Phase::Running { rt },
-                        Err(e) => Phase::Failed(format!("{e:#}")),
-                    };
-                }
-                Ok(Err(e)) => self.phase = Phase::Failed(format!("{e:#}")),
-                Err(TryRecvError::Disconnected) => self.phase = Phase::Failed("the loader stopped".into()),
-                Err(TryRecvError::Empty) => {}
+            let next = match rx.try_recv() {
+                Ok(Ok((world, font))) => Some(match self.start(&ctx, world, font) {
+                    Ok(rt) => Phase::Running { rt },
+                    Err(e) => Phase::Failed(format!("{e:#}")),
+                }),
+                Ok(Err(e)) => Some(Phase::Failed(format!("{e:#}"))),
+                Err(TryRecvError::Disconnected) => Some(Phase::Failed("the loader stopped".into())),
+                Err(TryRecvError::Empty) => None,
+            };
+            if let Some(next) = next {
+                lock(&self.shared).view = match &next {
+                    Phase::Running { rt } => View::Running(rt.clone()),
+                    Phase::Failed(e) => View::Failed(e.clone()),
+                    Phase::Loading { since, .. } => View::Loading(*since),
+                };
+                self.phase = next;
+                ctx.request_repaint_of(ViewportId::from_hash_of("control"));
             }
         }
         if let Some(tex) = &self.backdrop {
@@ -236,7 +283,7 @@ impl eframe::App for App {
                 p.tick(now);
                 p.snapshot()
             };
-            hud::draw(ui, &snap, &self.prefs);
+            hud::draw(ui, &snap, &lock(&self.shared).prefs);
         }
         self.control_window(&ctx);
     }
