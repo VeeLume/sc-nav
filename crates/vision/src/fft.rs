@@ -6,7 +6,9 @@
 //! ones (half the spectrum, half the work and memory of complex ones):
 //! maps equal the complex transforms' to float rounding (within 2e-5).
 //! Transforms are planned once per correlator, buffers are kept per
-//! thread, and templates can be [`Prepared`] once per padded size.
+//! thread, and templates can be [`Prepared`] once per padded size. Only the
+//! rows that hold data go through the row transform: a template's ten rows,
+//! not the 700 rows of padding under them.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -137,8 +139,18 @@ impl Plans {
             .max(self.col_inv.get_inplace_scratch_len())
     }
 
-    /// The 2D half spectrum of `src` (`fw` x `fh`, real) into `out`.
-    fn forward(&self, src: &[f32], out: &mut Vec<Complex<f32>>, fw: usize, fh: usize) {
+    /// The 2D half spectrum into `out` of a real `fw` x `fh` image whose
+    /// first `rows` rows `fill` writes (row index, the whole row of `fw`
+    /// values) and whose other rows are zero. A zero row's spectrum is
+    /// zero, so only the filled rows are transformed.
+    fn forward(
+        &self,
+        rows: usize,
+        mut fill: impl FnMut(usize, &mut [f32]),
+        out: &mut Vec<Complex<f32>>,
+        fw: usize,
+        fh: usize,
+    ) {
         let hw = fw / 2 + 1;
         out.clear();
         out.resize(hw * fh, ZERO);
@@ -146,8 +158,10 @@ impl Plans {
             b.scratch.resize(self.scratch_len(), ZERO);
             b.row.resize(fw, 0.0);
             let n = self.row.get_scratch_len();
-            for (y, spec) in out.chunks_exact_mut(hw).enumerate() {
-                b.row.copy_from_slice(&src[y * fw..(y + 1) * fw]);
+            for (y, spec) in out.chunks_exact_mut(hw).enumerate().take(rows) {
+                // the transform uses the row as working space: all of it
+                // is written again each time
+                fill(y, &mut b.row);
                 // lengths are the plan's, so this cannot fail
                 let _ = self
                     .row
@@ -196,12 +210,12 @@ impl Correlator {
     pub fn new(img: &Gray) -> Self {
         let (fw, fh) = (fast_len(img.w), fast_len(img.h));
         let plans = Plans::new(fw, fh);
-        let mut padded = vec![0.0f32; fw * fh];
-        for y in 0..img.h {
-            padded[y * fw..y * fw + img.w].copy_from_slice(&img.v[y * img.w..(y + 1) * img.w]);
-        }
         let mut spectrum = Vec::new();
-        plans.forward(&padded, &mut spectrum, fw, fh);
+        let row = |y: usize, row: &mut [f32]| {
+            row[..img.w].copy_from_slice(&img.v[y * img.w..(y + 1) * img.w]);
+            row[img.w..].fill(0.0);
+        };
+        plans.forward(img.h, row, &mut spectrum, fw, fh);
         let (iw, ih) = (img.w + 1, img.h + 1);
         let mut sum = vec![0.0f64; iw * ih];
         let mut sq = vec![0.0f64; iw * ih];
@@ -260,16 +274,16 @@ impl Correlator {
         }
         let n = (t.w * t.h) as f64;
         let mean = t.v.iter().map(|&x| x as f64).sum::<f64>() / n;
-        let mut padded = vec![0.0f32; self.fw * self.fh];
         let mut tn = 0.0f64;
-        for y in 0..t.h {
-            for x in 0..t.w {
-                let z = (t.v[y * t.w + x] as f64 - mean) as f32;
+        let row = |y: usize, row: &mut [f32]| {
+            for (o, &v) in row.iter_mut().zip(&t.v[y * t.w..(y + 1) * t.w]) {
+                let z = (v as f64 - mean) as f32;
                 tn += (z as f64) * (z as f64);
-                padded[y * self.fw + x] = z;
+                *o = z;
             }
-        }
-        self.plans.forward(&padded, spectrum, self.fw, self.fh);
+            row[t.w..].fill(0.0);
+        };
+        self.plans.forward(t.h, row, spectrum, self.fw, self.fh);
         Some(tn)
     }
 
@@ -569,6 +583,33 @@ mod tests {
         let small = Correlator::new(&noise(30, 30, 8));
         let p = c.prepare(&noise(5, 5, 9)).unwrap();
         assert_eq!(small.ncc_prepared(&p).v.len(), 0);
+    }
+
+    /// The spectrum as it was computed: every padded row transformed.
+    fn spectrum_ref(g: &Gray, fw: usize, fh: usize) -> Vec<Complex<f32>> {
+        let plans = Plans::new(fw, fh);
+        let mut out = Vec::new();
+        let row = |y: usize, row: &mut [f32]| {
+            row.fill(0.0);
+            if y < g.h {
+                row[..g.w].copy_from_slice(&g.v[y * g.w..(y + 1) * g.w]);
+            }
+        };
+        plans.forward(fh, row, &mut out, fw, fh);
+        out
+    }
+
+    #[test]
+    fn rows_of_padding_are_not_transformed_and_nothing_changes() {
+        for (w, h) in [(70, 45), (45, 32), (9, 3), (64, 1)] {
+            let img = noise(w, h, 21);
+            let c = Correlator::new(&img);
+            let (fw, fh) = c.padded();
+            let want = spectrum_ref(&img, fw, fh);
+            assert_eq!(c.spectrum.len(), want.len());
+            // the same values (a zero may differ in sign)
+            assert!(c.spectrum.iter().zip(&want).all(|(a, b)| a == b), "{w}x{h}");
+        }
     }
 
     #[test]
