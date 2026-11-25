@@ -56,7 +56,9 @@ const RETRY: Duration = Duration::from_secs(5);
 ///
 /// The game window is captured with a kept [`Session`] and only the overlay's
 /// corner ([`region`]) is copied off the GPU: under a millisecond a grab,
-/// where grabbing the whole screen took ~18 ms of CPU. Windows in front of
+/// where grabbing the whole screen took ~18 ms of CPU. The frame read is the
+/// next one the game shows after the grab starts (the session waits for it),
+/// not one left over from the grab before. Windows in front of
 /// the game (sc-nav's own HUD included) don't get in the way. Without the
 /// game (not running, minimised) the loop looks again every few seconds.
 pub fn watch(

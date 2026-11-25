@@ -11,6 +11,11 @@
 //!   device, the capture and the CPU copy are set up once; each call hands
 //!   out the newest frame, whole ([`Session::frame`]) or only a rectangle
 //!   of it ([`Session::region`]), which is all that leaves the GPU.
+//!   Nothing runs between calls: the capture's two-frame pool fills and
+//!   Windows drops what comes after, so a call that finds it full empties
+//!   it and waits for the next frame (one frame interval of the game, at
+//!   most 100 ms when the window has stopped changing) instead of handing
+//!   out a frame from just after the previous call.
 //!
 //! Moved from Starlume's `svc-capture::window`; frames are
 //! [`image::RgbaImage`].
@@ -91,13 +96,14 @@ impl Session {
     }
 
     /// The newest frame's size, to place a [`Session::region`] in. Waits
-    /// (up to two seconds) only when no frame has arrived yet.
+    /// up to two seconds when no frame has arrived yet, and for the next
+    /// frame (up to 100 ms) when the last call was long enough ago that
+    /// the frames waiting are old.
     pub fn newest_size(&mut self) -> Result<(u32, u32), CaptureError> {
         self.0.newest()
     }
 
-    /// The newest frame, whole. Waits (up to two seconds) only when none has
-    /// arrived since the session opened.
+    /// The newest frame, whole. Waits as [`Session::newest_size`] does.
     pub fn frame(&mut self) -> Result<Frame, CaptureError> {
         let (w, h) = self.0.newest()?;
         self.0.copy(0, 0, w, h)
@@ -158,6 +164,9 @@ mod imp {
     /// Frames the pool holds: one being copied, one arriving.
     const BUFFERS: i32 = 2;
     const FIRST_FRAME: Duration = Duration::from_secs(2);
+    /// How long a call waits for a frame newer than the ones a full pool
+    /// held: a few frames of a game at 30 fps.
+    const FRESH: Duration = Duration::from_millis(100);
 
     fn os(e: windows::core::Error) -> CaptureError {
         CaptureError::Os(e.message().to_string())
@@ -327,8 +336,10 @@ mod imp {
             self.latest.as_ref().map_or((0, 0), |l| (l.1, l.2))
         }
 
-        /// Take every frame waiting in the pool into `latest`; wait for the
-        /// first one if there is none yet. The newest frame's size.
+        /// Take the newest frame into `latest`: the newest waiting in the
+        /// pool, or, when the pool was full (it then dropped every frame
+        /// since), the next one to arrive. Waits for the first frame if
+        /// there is none yet. The newest frame's size.
         pub fn newest(&mut self) -> Result<(u32, u32), CaptureError> {
             if !unsafe { IsWindow(Some(self.hwnd)) }.as_bool() {
                 return Err(CaptureError::NoWindow);
@@ -338,11 +349,13 @@ mod imp {
             }
             let start = Instant::now();
             loop {
-                let mut newest = None;
-                while let Ok(f) = self.pool.TryGetNextFrame() {
-                    if let Some(old) = newest.replace(f) {
-                        let _ = old.Close();
-                    }
+                let (mut newest, waiting) = self.drain();
+                // A full pool took no more frames: what it held is from just
+                // after the last call, however long ago that was.
+                if waiting >= BUFFERS as usize
+                    && let Some(stale) = newest.take()
+                {
+                    newest = Some(self.fresher(stale));
                 }
                 if let Some(f) = newest {
                     let taken = self.take(&f);
@@ -357,6 +370,36 @@ mod imp {
                 }
                 std::thread::sleep(Duration::from_millis(8));
             }
+        }
+
+        /// Every frame waiting in the pool: the newest, the others closed,
+        /// and how many there were.
+        fn drain(&self) -> (Option<Direct3D11CaptureFrame>, usize) {
+            let mut newest: Option<Direct3D11CaptureFrame> = None;
+            let mut n = 0;
+            while let Ok(f) = self.pool.TryGetNextFrame() {
+                n += 1;
+                if let Some(old) = newest.replace(f) {
+                    let _ = old.Close();
+                }
+            }
+            (newest, n)
+        }
+
+        /// The next frame to arrive, now that the pool has room again, or
+        /// `stale` when none comes within [`FRESH`] (the window's content
+        /// isn't changing: `stale` is then how it still looks, unless it
+        /// changed while the pool was full and stopped since).
+        fn fresher(&self, stale: Direct3D11CaptureFrame) -> Direct3D11CaptureFrame {
+            let start = Instant::now();
+            while start.elapsed() < FRESH {
+                if let (Some(f), _) = self.drain() {
+                    let _ = stale.Close();
+                    return f;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stale
         }
 
         /// Keep `frame`'s content in `latest`; follow a window resize.
